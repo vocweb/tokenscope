@@ -27,6 +27,7 @@ walkdir = "2"
 # watch ~/.claude/projects so the dashboard refreshes within ~1s of a log write
 notify = "6"
 tauri-plugin-single-instance = "2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2" }

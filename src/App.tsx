@@ -4,12 +4,17 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { domToPng } from "modern-screenshot";
 import {
-  Dashboard, PeriodReport, ModelStat, Theme, TH,
+  Dashboard, PeriodReport, ModelStat, ToolStat, UsageLimit, Theme, TH,
   fetchDashboard, fmtInt, fmtTokens, pct,
 } from "./data";
 import {
   TokenGlyph, Segmented, BarChart, Sparkline, CostDonut, BarList, Heatmap,
 } from "./charts";
+
+// The four windows the panel can show. "5H" is the rolling block subscription
+// plans meter (report_five_hour); the rest are calendar windows.
+type Period = "5H" | "Day" | "Week" | "Month";
+const PERIODS: readonly Period[] = ["5H", "Day", "Week", "Month"];
 
 // Count up to `target`. Restarts from 0 whenever `resetKey` changes (popover
 // open / period switch); on a live value change it eases from the current
@@ -92,6 +97,96 @@ function ModelRow({ m, max, theme, share }: { m: ModelStat; max: number; theme: 
   );
 }
 
+// One source CLI's share of the period (Claude Code / Codex / opencode /
+// Oh My Pi). Same row geometry as ModelRow so the two lists line up.
+function ToolRow({ s, max, theme, share }: { s: ToolStat; max: number; theme: Theme; share: number }) {
+  const pctStr = share % 1 === 0 ? share.toFixed(0) : share.toFixed(1);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "5px 0" }}>
+      <div style={{ minWidth: 0, flex: "0 0 118px" }}>
+        <div style={{ font: `500 11.5px ${theme.ui}`, color: theme.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{s.label}</div>
+        <div style={{ font: `500 9px ${theme.mono}`, color: theme.faint, marginTop: 1, whiteSpace: "nowrap" }}>
+          {fmtInt(s.requests)} req · {fmtInt(s.sessions)} sess
+        </div>
+      </div>
+      <div style={{ flex: 1, height: 5, borderRadius: 3, background: theme.gridLine, overflow: "hidden" }}>
+        <div style={{ width: `${(s.tokens / max) * 100}%`, height: "100%", background: theme.accentSoft, borderRadius: 3 }} />
+      </div>
+      <span style={{ font: `500 10.5px ${theme.mono}`, color: theme.dim, flex: "0 0 auto", width: 42, textAlign: "right" }}>{fmtTokens(s.tokens)}</span>
+      <span style={{ font: `600 10.5px ${theme.mono}`, color: theme.text, flex: "0 0 auto", width: 40, textAlign: "right" }}>{pctStr}%</span>
+    </div>
+  );
+}
+
+// Time until a window resets, e.g. "1h 12m" / "4d 3h". Empty when unknown.
+function fmtReset(ms: number): string {
+  if (!ms) return "";
+  const left = ms - Date.now();
+  if (left <= 0) return "resetting";
+  const mins = Math.floor(left / 60000);
+  const hours = Math.floor(mins / 60);
+  const days = Math.floor(hours / 24);
+  if (days >= 1) return `${days}d ${hours % 24}h`;
+  if (hours >= 1) return `${hours}h ${mins % 60}m`;
+  return `${mins}m`;
+}
+
+// How old an observation may be before its row stops presenting it as current.
+// The provider poll runs every 15 minutes, so this is three missed polls: past
+// that the number is a last-known value, not a reading. A window whose reset
+// time has already passed is stale by definition — the provider has rolled it
+// and we never heard the new fill level. That is exactly what happened when the
+// Claude OAuth token expired: the rows kept showing "67% · resets 20:30" for
+// hours after that window had already reset.
+const LIMIT_STALE_MS = 45 * 60 * 1000;
+
+// One provider-reported plan window. These are current state rather than
+// period-scoped, so the row shows in every period tab and is titled with where
+// the number came from (live API call vs Oh My Pi's last snapshot).
+function PlanLimitRow({ l, theme }: { l: UsageLimit; theme: Theme }) {
+  const name = l.provider === "opencode-go" ? "opencode go" : l.provider === "anthropic" ? "Claude" : l.provider;
+  // Label minus its provider prefix and "limit" suffix — that is what tells
+  // apart two windows of the same length ("7 Day" vs "7 Day (Fable)").
+  const title = l.label.replace(/ limit$/i, "").replace(/^(claude|anthropic|opencode go)\s+/i, "") || l.window;
+  const now = Date.now();
+  const rolled = !!l.resetsAt && l.resetsAt <= now;
+  const stale = rolled || (!!l.observedAt && now - l.observedAt > LIMIT_STALE_MS);
+  const hot = l.status === "exhausted" || l.status === "rate-limited";
+  const warm = hot || l.status === "warning" || l.used >= 80;
+  // A stale row keeps its last value but loses the status colour: it must not
+  // look like a live reading of the current window.
+  const col = stale ? theme.faint : hot ? "#e0795f" : warm ? "#e0a75f" : theme.accent;
+  const pctStr = l.used % 1 === 0 ? l.used.toFixed(0) : l.used.toFixed(1);
+  const reset = fmtReset(l.resetsAt);
+  const seen = l.observedAt
+    ? new Date(l.observedAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
+    : "";
+  const sub = stale
+    ? `${rolled ? "window reset" : "stale"}${seen ? ` · read ${seen}` : ""}`
+    : reset
+      ? `resets in ${reset}`
+      : l.status;
+  return (
+    <div
+      title={`${l.source === "api" ? "live" : "Oh My Pi snapshot"}${seen ? ` · as of ${seen}` : ""}${stale ? " · not current" : ""}`}
+      style={{ display: "flex", alignItems: "center", gap: 9, padding: "5px 0" }}
+    >
+      <div style={{ minWidth: 0, flex: "0 0 118px" }}>
+        <div style={{ font: `500 11.5px ${theme.ui}`, color: stale ? theme.dim : theme.text, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+          {name} · {title}
+        </div>
+        <div style={{ font: `500 9px ${theme.mono}`, color: theme.faint, marginTop: 1, whiteSpace: "nowrap" }}>
+          {sub}
+        </div>
+      </div>
+      <div style={{ flex: 1, height: 5, borderRadius: 3, background: theme.gridLine, overflow: "hidden" }}>
+        <div style={{ width: `${Math.min(100, Math.max(0, l.used))}%`, height: "100%", background: col, borderRadius: 3 }} />
+      </div>
+      <span style={{ font: `600 10.5px ${theme.mono}`, color: col, flex: "0 0 auto", width: 40, textAlign: "right" }}>{pctStr}%</span>
+    </div>
+  );
+}
+
 function MiniStat({ label, value, sub, theme, accent, children }:
   { label: string; value: string; sub?: string; theme: Theme; accent?: string; children?: React.ReactNode }) {
   return (
@@ -124,8 +219,8 @@ function SplitLegend({ t, cacheM, restM, cachedPct }:
       display: "flex", alignItems: "center", gap: 14,
       font: `500 10px ${t.mono}`, color: t.dim, marginBottom: 14, whiteSpace: "nowrap", overflow: "hidden",
     }}>
-      <span><span style={{ color: t.accent }}>●</span> {compact ? "Cache" : "Cached"} {cacheM.toFixed(2)}M</span>
-      <span><span style={{ color: t.accentSoft }}>●</span> New {restM.toFixed(2)}M</span>
+      <span><span style={{ color: t.accent }}>●</span> {compact ? "Cache" : "Cached"} {fmtTokens(cacheM)}</span>
+      <span><span style={{ color: t.accentSoft }}>●</span> New {fmtTokens(restM)}</span>
       <span style={{ color: t.faint }}>{cachedPct}% cached</span>
     </div>
   );
@@ -191,18 +286,43 @@ function ScreenshotButton({ theme, busy, onClick }: { theme: Theme; busy: boolea
 
 function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash: Dashboard; dark: boolean; themePref: "dark" | "light" | "system"; onToggleTheme: () => void; openGen: number; active: boolean }) {
   const t = TH[dark ? "dark" : "light"];
-  // Drag the popover by its body (Windows/Linux only — macOS uses the menu-bar
-  // NSPanel and is gated out). A real OS window-drag begins only once the
-  // pointer moves past a small threshold, so a plain click still clicks through
-  // / dismisses and never arms the hide-suppression guard.
-  const canDrag = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
+  // "popover" (menu-bar panel, default) or "window" (a normal decorated app
+  // window: opaque, square corners, no custom drag region — the native title bar
+  // does the moving there). Read once; the tray toggle restarts the app.
+  const [windowMode, setWindowMode] = useState<"popover" | "window">("popover");
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    invoke<string>("get_window_mode")
+      .then((m) => setWindowMode(m === "window" ? "window" : "popover"))
+      .catch(() => {});
+  }, []);
+  const normalWindow = windowMode === "window";
+  // The popover window is transparent and the rounded card paints its own
+  // background; a normal window is opaque edge to edge, so nothing of the
+  // desktop shows through its square corners or behind short content.
+  useEffect(() => {
+    document.body.style.background = normalWindow ? t.card : "transparent";
+  }, [normalWindow, t.card]);
+  // Drag the popover by its body (Windows/Linux only, popover mode only — macOS
+  // uses the menu-bar NSPanel and a normal window has a title bar). A real OS
+  // window-drag begins only once the pointer moves past a small threshold, so a
+  // plain click still clicks through / dismisses and never arms the
+  // hide-suppression guard.
+  const canDrag = !normalWindow && typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && !navigator.userAgent.includes("Macintosh");
   const dragRef = useRef<{ x: number; y: number } | null>(null);
-  const [period, setPeriod] = useState<"Day" | "Week" | "Month">("Week");
-  const P: PeriodReport = period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
+  // "5H" is the rolling window plan limits are metered in (see report_five_hour);
+  // Day/Week/Month stay calendar-based.
+  const [period, setPeriod] = useState<Period>("Week");
+  const P: PeriodReport = period === "5H" ? dash.fiveHour : period === "Day" ? dash.day : period === "Month" ? dash.month : dash.week;
   const M = P.metrics;
   // animated Total tokens: counts up from 0 on each open / period switch;
   // held at 0 while the popover is hidden so it never flashes the final value.
-  const animTotal = useCountUp(M.totalTokens, `${period}:${openGen}`, active);
+  // A detached window is never "hidden" in that sense — it stays on screen while
+  // unfocused — so it always counts (and eases) instead of dropping to 0.
+  const animTotal = useCountUp(M.totalTokens, `${period}:${openGen}`, active || normalWindow);
+  // Same unit switch as fmtTokens: >1000M reads better as "3.75B".
+  const heroUnit = animTotal >= 1000 ? "B" : "M";
+  const heroVal = animTotal >= 1000 ? animTotal / 1000 : animTotal;
   // Split bar = cached portion vs the rest (uncached input + output), as exact
   // width percentages. Width% (not flexGrow + flexBasis:0): in the WebKit webview
   // that combination sizes each segment to roughly its own grow factor — an
@@ -215,6 +335,15 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const cachePct = splitTot > 0 ? (M.cacheTokens / splitTot) * 100 : 0;
   const restPct = splitTot > 0 ? ((M.inputTokens + M.outputTokens) / splitTot) * 100 : 0;
   const models = P.models;
+  // By coding agent. The roster comes from the month window, so a period where
+  // one agent is idle still shows it (with 0) instead of vanishing — otherwise
+  // a quiet week looks like the agent isn't read at all. A single-agent user
+  // gets no section.
+  const tools = dash.month.tools.length > 1
+    ? dash.month.tools.map((m) => P.tools.find((s) => s.name === m.name) ?? { ...m, tokens: 0, cost: 0, requests: 0, sessions: 0 })
+    : P.tools;
+  const maxT = Math.max(...tools.map((s) => s.tokens), 1e-9);
+  const toolShares = sharePcts(tools.map((s) => s.tokens));
   // Hide noise: 0% token-share rows, and $0 entries in the cost donut.
   // Show models whose share is at least 0.1% when rounded to 1 decimal; below
   // that it'd render a meaningless "0.0%" (a negligible token share). Such a
@@ -228,7 +357,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
   const maxM = Math.max(...tokenModels.map((m) => m.tokens), 1e-9);
   // Per-row shares that sum to exactly 100.0% (largest-remainder over visible rows).
   const tokenShares = sharePcts(tokenModels.map((m) => m.tokens));
-  const trendSub = { Day: "today 24h", Week: "this week", Month: "this month" }[period];
+  const trendSub = { "5H": "last 5h", Day: "today 24h", Week: "this week", Month: "this month" }[period];
 
   // screenshot capture: rasterize the full panel card to a PNG and hand it to
   // the Rust `save_screenshot` command (browser preview falls back to a download).
@@ -280,7 +409,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
     <div style={{
       width: "100%", height: "100vh", overflow: "hidden", boxSizing: "border-box",
       position: "relative",
-      background: "transparent", padding: 0,
+      background: normalWindow ? t.card : "transparent", padding: 0,
       fontFamily: t.ui,
     }}>
       <div className="om-scroll"
@@ -304,8 +433,8 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         onMouseUp={canDrag ? () => { dragRef.current = null; } : undefined}
         style={{
         width: "100%", height: "100%", overflowY: "auto",
-        borderRadius: 12, background: dark ? "#1f2226" : "#ffffff",
-        border: `1px solid ${dark ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)"}`,
+        borderRadius: normalWindow ? 0 : 12, background: t.card,
+        border: normalWindow ? "none" : `1px solid ${dark ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)"}`,
         padding: 0, color: t.text, cursor: canDrag ? "grab" : undefined,
       }}>
         {/* sticky header — stays put while the body scrolls */}
@@ -321,7 +450,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             <span style={{ font: `600 13px ${t.ui}`, color: t.text, letterSpacing: ".01em" }}>Tokenscope</span>
           </div>
           <div data-no-drag="" style={{ display: "flex", alignItems: "center", gap: 8, cursor: "default" }}>
-            <Segmented value={period} theme={t} onSelect={(v) => setPeriod(v as any)} />
+            <Segmented value={period} items={PERIODS} theme={t} onSelect={setPeriod} />
             <ThemeToggle pref={themePref} theme={t} onCycle={onToggleTheme} />
             <ScreenshotButton theme={t} busy={shotBusy} onClick={captureScreenshot} />
           </div>
@@ -333,7 +462,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
           <div>
             <div style={{ font: `500 10px ${t.ui}`, color: t.dim, letterSpacing: ".04em", textTransform: "uppercase" }}>Total tokens</div>
             <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 3 }}>
-              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{animTotal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>M</span></span>
+              <span style={{ font: `600 30px ${t.mono}`, color: t.text, letterSpacing: "-.01em" }}>{heroVal.toFixed(2)}<span style={{ font: `500 15px ${t.mono}`, color: t.dim, marginLeft: 2 }}>{heroUnit}</span></span>
               {Math.round(M.deltaTokens) !== 0 && <Delta v={M.deltaTokens} theme={t} />}
             </div>
           </div>
@@ -359,6 +488,29 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>No usage in this period</div>}
         {tokenModels.map((m, i) => <ModelRow key={i} m={m} max={maxM} theme={t} share={tokenShares[i]} />)}
         <SectionRule t={t} m="10px 0 10px" />
+        {/* by coding agent — Claude Code / Codex / opencode / Oh My Pi */}
+        {tools.length > 1 && (
+          <>
+            <div style={{ marginBottom: 4 }}><Label t={t}>By coding agent</Label></div>
+            {tools.map((s, i) => <ToolRow key={s.name} s={s} max={maxT} theme={t} share={toolShares[i]} />)}
+            <SectionRule t={t} m="10px 0 10px" />
+          </>
+        )}
+        {/* plan limits — provider-reported windows, current state (not period-scoped) */}
+        {dash.limits.length > 0 && (
+          <>
+            <SectionRule t={t} m="10px 0 10px" />
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+              <Label t={t}>Plan limits</Label>
+              <span style={{ font: `500 9.5px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>
+                {dash.limits.some((l) => l.source === "api") ? "live" : "snapshot"}
+              </span>
+            </div>
+            {dash.limits.map((l) => (
+              <PlanLimitRow key={`${l.provider}:${l.window}:${l.label}`} l={l} theme={t} />
+            ))}
+          </>
+        )}
         {/* cost donut */}
         <div style={{ marginBottom: 8 }}><Label t={t}>Cost by model</Label></div>
         {costModels.length > 0
@@ -462,7 +614,9 @@ export default function App() {
   const cycleTheme = () =>
     setThemePref((p) => {
       const n = p === "dark" ? "light" : p === "light" ? "system" : "dark";
-      try { localStorage.setItem("tokenscope-theme", n); } catch {}
+      // Best-effort: storage can be unavailable (private mode), and the theme
+      // still applies for this session either way.
+      try { localStorage.setItem("tokenscope-theme", n); } catch { /* ignore */ }
       return n;
     });
 
@@ -512,11 +666,6 @@ export default function App() {
       unlisten.forEach((u) => u());
     };
   }, []);
-
-  // window is transparent; the rounded card paints its own background
-  useEffect(() => {
-    document.body.style.background = "transparent";
-  }, [dark]);
 
   // Suppress per-property CSS transitions across a theme flip so the panel
   // repaints in the new theme in one step instead of cross-fading each color

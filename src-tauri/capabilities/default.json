@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the main window",
-  "windows": ["main"],
+  "description": "Default capabilities for the popover and the detached window",
+  "windows": ["main", "dashboard"],
   "permissions": [
     "core:default",
     "core:event:default",

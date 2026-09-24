@@ -3,18 +3,28 @@ import { invoke } from "@tauri-apps/api/core";
 export interface SeriesPoint { label: string; full: string; input: number; cache: number; output: number }
 export interface ModelStat { name: string; vendor: string; tokens: number; cost: number; color: string; priced: boolean }
 export interface NamedCount { name: string; count: number }
+export interface ToolStat { name: string; label: string; tokens: number; cost: number; requests: number; sessions: number }
 export interface Metrics {
   totalTokens: number; inputTokens: number; cacheTokens: number; outputTokens: number; cost: number;
   mcpCalls: number; skillCalls: number; requests: number; sessions: number;
   deltaTokens: number; deltaCost: number; servers: number; skills: number;
 }
 export interface PeriodReport {
-  metrics: Metrics; series: SeriesPoint[]; models: ModelStat[];
+  metrics: Metrics; series: SeriesPoint[]; models: ModelStat[]; tools: ToolStat[];
   mcp: NamedCount[]; skills: NamedCount[]; reqTrend: number[]; costTrend: number[];
 }
 export interface HeatDay { date: string; tokens: number; level: number }
+/** A provider-reported plan window (5-hour / weekly / monthly). */
+export interface UsageLimit {
+  provider: string; window: string; label: string; used: number; status: string;
+  resetsAt: number; observedAt: number; source: string;
+}
 export interface Dashboard {
   day: PeriodReport; week: PeriodReport; month: PeriodReport;
+  /** rolling last 5 hours — the window plan limits are metered in */
+  fiveHour: PeriodReport;
+  /** provider-reported plan windows (not period-scoped) */
+  limits: UsageLimit[];
   heatmap: HeatDay[]; todayTokens: number; generatedAt: string;
 }
 
@@ -30,6 +40,9 @@ export async function fetchDashboard(): Promise<Dashboard> {
 
 // ── formatting helpers ──────────────────────────────────────────
 export const fmtTokens = (m: number) => {
+  // Multi-agent totals can pass 1000M (an agentic harness logs billions of
+  // tokens a day), so switch unit instead of printing a 7-character "3750.93M".
+  if (m >= 1000) return (m / 1000).toFixed(2) + "B";
   if (m >= 1) return m.toFixed(2) + "M";
   const k = m * 1000;
   // one decimal for sub-1K totals (e.g. "0.4K"), but only when it rounds to a

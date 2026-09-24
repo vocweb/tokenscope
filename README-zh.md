@@ -4,7 +4,7 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-**macOS 菜单栏 / Windows 系统托盘工具**，展示 Claude CLI 的 **每日 Token 用量、估算花费、按模型 / MCP / Skill 的调用统计**。
+**macOS 菜单栏 / Windows 系统托盘工具**，展示你的各个 AI coding agent 的 **每日 Token 用量、估算花费、按 agent / 模型 / MCP / Skill 的调用统计** —— **Claude Code、Codex CLI、opencode、Oh My Pi** 汇总在一处。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）/ **Rust**（数据层）。
 
@@ -13,25 +13,44 @@
 ## 它做什么
 
 - 菜单栏图标旁显示当日 Token 数（如 `⬡ 14.00M`）
-- 点击打开面板：Day / Week / Month 切换
+- 点击打开面板：**5H / Day / Week / Month** 切换 —— `5H` 是**滚动**的最近 5 小时窗口（订阅计划的 session 额度就按它计），Day/Week/Month 仍是自然日/周/月
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
-- 三个切片：**按模型** / **按 MCP 调用** / **按 Skill 调用**
+- 四个切片：**按 agent**（Claude Code / Codex / opencode / Oh My Pi）/ **按模型** / **按 MCP 调用** / **按 Skill 调用**
+- **计划额度（Plan limits）**：服务商侧的 5 小时 / 每周 / 每月窗口（opencode Go/Zen、Claude），显示已用百分比与重置倒计时 —— 直接调用接口获取，不是从日志推算
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
-- **只统计用户自己安装的 MCP / Skill**，过滤所有 Claude 内置工具与 Anthropic 自带 MCP
+- **浮窗与普通窗口并存**（托盘菜单 → *Open in Window*）：左键点击菜单栏图标始终打开快速查看浮窗；*Open in Window* 另外打开一个普通应用窗口（带标题栏、可缩放，macOS 出现在 Dock / Windows 出现在任务栏，位置和大小会被记住）。关闭该窗口只是隐藏（应用继续留在菜单栏），再次打开无需重启
+- Claude Code 部分：**只统计用户自己安装的 MCP / Skill**，过滤所有 Claude 内置工具与 Anthropic 自带 MCP
 
 ## 数据来源（零侵入，只读）
 
 | 用途 | 路径 |
 |------|------|
-| 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
-| 用户 MCP 白名单 | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
-| 用户 Skill 白名单 | `~/.claude/skills/` 目录 |
+| **Claude Code** 会话日志（Token / 模型 / 工具调用） | `~/.claude/projects/**/*.jsonl` |
+| **Codex CLI** rollout 日志（Token / 模型） | `$CODEX_HOME/sessions/**/rollout-*.jsonl`（默认 `~/.codex/...`） |
+| **opencode** 会话（新 SQLite 存储） | `~/.local/share/opencode/opencode.db` → `message.data` |
+| **opencode** 会话（旧 JSON 存储） | `~/.local/share/opencode/storage/message/**/*.json` |
+| **Oh My Pi** 会话日志 | `~/.omp/agent/sessions/**/*.jsonl` + `~/.omp/profiles/*/agent/sessions/**/*.jsonl` |
+| 用户 MCP 白名单（Claude Code） | `~/.claude.json` → `mcpServers` + `projects[*].mcpServers` |
+| 用户 Skill 白名单（Claude Code） | `~/.claude/skills/` 目录 |
+| 计划额度（opencode Go/Zen） | `GET https://opencode.ai/zen/go/v1/usage`（Bearer API key，只读） |
+| 计划额度（Claude Code） | `GET https://api.anthropic.com/api/oauth/usage`（Bearer OAuth token + `anthropic-beta: oauth-2025-04-20`） |
+| 计划额度（其他服务商） | `~/.omp/agent/agent.db` → `usage_history`（Oh My Pi 自己轮询的快照） |
+| opencode-go API key（绝不打印/落盘） | 环境变量 `OPENCODE_GO_API_KEY` / `OPENCODE_API_KEY` → `~/.omp/**/agent.db` 的 `auth_credentials` → `~/.local/share/opencode/auth.json` |
+| Claude OAuth token（绝不打印/落盘） | 环境变量 `CLAUDE_CODE_OAUTH_TOKEN` → macOS 钥匙串 `Claude Code-credentials*`（服务名带账号哈希后缀，用 `dump-keychain` 发现；经 `/usr/bin/security` 读取，授权归属于该系统二进制，重新构建不会重复弹框）→ `~/.claude/.credentials.json` → `~/.omp/**/agent.db` 的 `auth_credentials`；全部读取后依次试用，接口接受的第一个生效（各处 token 过期时间并不一致） |
 | 模型价格 | **主**：[models.dev](https://models.dev/api.json)（裸模型名，匹配 Claude CLI 日志）→ **兜底**：[LiteLLM](https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json) → 内置快照。缓存于 `~/Library/Caches/tokenscope/`，24h 刷新，离线回退 |
+
+未安装的 agent：目录不存在即跳过，不报错。
 
 ### 关键处理
 - 按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
+- 各源 token 口径：Claude Code 直接给出四类；**Codex** 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；**opencode** 单独的 `reasoning` 计入 output；**Oh My Pi** 与 Claude Code 一致
+- **Codex** rollout 同时携带本轮 `last_token_usage` 与会话累计 `total_token_usage`，取本轮值，token 落在真实发生的小时/日期；一个 rollout 文件 = 一个会话
+- **Oh My Pi** 同一会话会拆成多个 agent 日志（`__advisor.*.jsonl`、subagent），归入同一 session，且所有 agent 的 token 都计入
+- MCP / Skill 两个榜单只读 **Claude Code** 日志（白名单来自 Claude 自己的配置）；其他 agent 的工具调用计入其 agent 总量，不进这两个榜单
+- 持久化缓存会把**已结束的日期**折叠成 (日期, agent, session, 模型) 一行：只有「今天」需要逐条精度（Day 图 24 个小时桶），否则一天数万次请求的 agent 会把缓存撑到数百 MB
 - token 拆分：`input`(未缓存) / `cache`(creation+read) / `output`；UI 默认把 cache 并入 In 显示，并单列「cached %」
-- 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）；models.dev 优先官方裸名价
+- 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）→ 命名空间剥离（`anthropic.claude-opus-5` → `claude-opus-5`）；models.dev 优先官方裸名价
+- **按裸模型名跨 agent 归组**：Oh My Pi 记的是 `openai.gpt-5.5` / `global.openai.gpt-5.6-sol`，Codex 记的是 `gpt-5.5`，同一个模型不能裂成好几行（版本点号如 `glm-5.1` 不算命名空间，保持原样）
 - 成本按四类 token 分别计价；模型带 `priced` 标记，**两源都查不到的模型只计 Token、UI 标注「暂无定价」**
 - 日志只有裸模型名、无厂商信息 → 第三方模型默认取官方厂商价（估算）
 - 工具分类：`mcp__<server>__*` 且 server 在用户配置中 → MCP；Skill 调用（`Skill` 工具的 `input.skill`，或 `/skill` 斜杠命令）且在 skills 目录中 → Skill；其余忽略
@@ -109,7 +128,7 @@ brew update && brew upgrade --cask tokenscope
 
 - **macOS**：菜单栏出现图标 + 当日 Token 数（如 `⬡ 12.40M`）
 - **Windows**：系统托盘出现图标。Windows 任务栏托盘 API 不支持在图标旁显示文字，**鼠标悬停托盘图标**即可看到当日 Token 数（提示气泡形如 `Tokenscope · today 12.40M`）
-- 左键点击图标开/关面板，右键出菜单（Open / Refresh / Quit）
+- 左键点击图标开/关浮窗，右键出菜单（Open / Refresh / **Open in Window** / Launch at Login / Quit）
 - 已自动设置**登录自启**，无需手动配置
 
 ## 开发
@@ -123,7 +142,8 @@ pnpm tauri dev         # 启动桌面 App（需要 Rust 工具链）
 
 ```bash
 pnpm dev               # http://localhost:1420
-# 刷新快照：
+# 刷新快照（example 会先加载真实价格表，费用才与 App 一致；
+# 直接 cargo run --example dump 只有内置快照，其余模型会显示「暂无定价」）：
 cd src-tauri && cargo run --example dump > ../public/dev-dashboard.json
 ```
 
@@ -143,7 +163,7 @@ src/                  React 前端
   charts.tsx          图表原语（柱状/甜甜圈/sparkline/热力图/分段控件）
   App.tsx             主面板
 src-tauri/src/
-  store.rs            JSONL 增量摄取（按 message.id 去重 + 多行合并）
+  store.rs            多 agent 增量摄取 —— Claude Code / Codex CLI / opencode（JSON + SQLite）/ Oh My Pi（按 message id 去重）
   parser.rs           聚合（Day/Week/Month + 热力图）
   pricing.rs          models.dev / LiteLLM 价格加载与计价
   config.rs           用户 MCP / Skill 白名单

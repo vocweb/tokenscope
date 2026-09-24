@@ -26,6 +26,18 @@ pub struct NamedCount {
     pub count: u64,
 }
 
+/// One coding agent's share of a period (Claude Code / Codex / opencode /
+/// Oh My Pi). `name` is the stable source id, `label` the display name.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolStat {
+    pub name: String,
+    pub label: String,
+    pub tokens: f64, // M tokens (input + cache + output)
+    pub cost: f64,   // USD estimate
+    pub requests: u64,
+    pub sessions: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Metrics {
     #[serde(rename = "totalTokens")]
@@ -56,6 +68,7 @@ pub struct PeriodReport {
     pub metrics: Metrics,
     pub series: Vec<SeriesPoint>,
     pub models: Vec<ModelStat>,
+    pub tools: Vec<ToolStat>,
     pub mcp: Vec<NamedCount>,
     pub skills: Vec<NamedCount>,
     #[serde(rename = "reqTrend")]
@@ -76,6 +89,12 @@ pub struct Dashboard {
     pub day: PeriodReport,
     pub week: PeriodReport,
     pub month: PeriodReport,
+    /// Rolling last 5 hours — the window plan limits are metered in (see
+    /// parser::report_five_hour).
+    #[serde(rename = "fiveHour")]
+    pub five_hour: PeriodReport,
+    /// Provider-reported plan windows (5-hour / weekly / monthly) — see limits.rs.
+    pub limits: Vec<crate::limits::UsageLimit>,
     pub heatmap: Vec<HeatDay>,
     #[serde(rename = "todayTokens")]
     pub today_tokens: f64, // M tokens, for the tray label

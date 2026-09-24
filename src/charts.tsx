@@ -15,8 +15,8 @@ export function TokenGlyph({ color = "#1f9d63", size = 14 }: { color?: string; s
   );
 }
 
-export function Segmented({ value, items = ["Day", "Week", "Month"], theme, onSelect }:
-  { value: string; items?: string[]; theme: Theme; onSelect?: (v: string) => void }) {
+export function Segmented<T extends string>({ value, items, theme, onSelect }:
+  { value: T; items: readonly T[]; theme: Theme; onSelect?: (v: T) => void }) {
   const t = theme;
   return (
     <div style={{ display: "inline-flex", padding: 2, borderRadius: 7, background: t.segBg, border: `1px solid ${t.segBorder}`, gap: 2 }}>

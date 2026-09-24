@@ -10,8 +10,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime};
 
 // Process-wide memoized price table. Loaded once off the main thread (see
-// reload_shared) and refreshed every 24h, so build_dashboard — which holds
-// BUILD_LOCK — only ever does a cheap Arc clone, never JSON parsing or network.
+// reload_shared) and refreshed every 24h, so build_dashboard — which holds the
+// store lock — only ever does a cheap Arc clone, never JSON parsing or network.
 static PRICING: OnceLock<RwLock<Arc<Pricing>>> = OnceLock::new();
 
 const MODELSDEV_URL: &str = "https://models.dev/api.json";
@@ -28,8 +28,13 @@ const LITELLM_SNAPSHOT: &str = include_str!("../snapshots/litellm.json");
 pub struct ModelPrice {
     pub input: f64,        // per-token USD
     pub output: f64,       // per-token USD
-    pub cache_create: f64, // per-token USD
+    pub cache_create: f64, // per-token USD, 5-minute cache write
     pub cache_read: f64,   // per-token USD
+    /// Per-token USD for a 1-hour cache write. LiteLLM publishes this
+    /// (`cache_creation_input_token_cost_above_1hr`); models.dev does not, so for
+    /// Claude ids it is derived in `insert`. 0 means "not published", and `cost`
+    /// falls back to the 5-minute rate rather than billing the tokens at zero.
+    pub cache_create_1h: f64,
 }
 
 impl ModelPrice {
@@ -52,6 +57,35 @@ fn normalize_key(s: &str) -> String {
 
 fn bare(s: &str) -> &str {
     s.rsplit('/').next().unwrap_or(s)
+}
+
+/// Leading namespace words seen in front of a model id in agent logs. Bedrock /
+/// Azure / Vertex deployments and resellers spell the same model with a dotted
+/// provider path, and Oh My Pi logs those verbatim ("global.openai.gpt-5.6-sol",
+/// "anthropic.claude-opus-5", "bedrock-mantle.openai.gpt-5.5").
+const PROVIDER_SEGMENTS: &[&str] = &[
+    "global", "us", "eu", "jp", "au", "ca", "sa", "ap", "apac", "us-gov", "gov", "anthropic",
+    "openai", "google", "gemini", "meta", "mistral", "xai", "deepseek", "qwen", "moonshot",
+    "minimax", "bedrock", "bedrock-mantle", "azure", "azure-anthropic", "aws-bedrock", "vertex",
+    "vertex-anthropic", "amazon", "aws", "amazon-bedrock", "microsoft",
+];
+
+/// Reduce a logged model id to the name the price tables index and the UI groups
+/// by: drop leading provider segments and a local quantization suffix
+/// ("...@4bit"). Only *known* provider words are stripped, so a version dot
+/// ("glm-5.1", "gpt-5.6-sol") is never touched.
+pub fn canonical_id(id: &str) -> String {
+    let mut s = id.split('@').next().unwrap_or(id);
+    loop {
+        let Some((head, tail)) = s.split_once('.') else {
+            break;
+        };
+        if tail.is_empty() || !PROVIDER_SEGMENTS.contains(&head.to_ascii_lowercase().as_str()) {
+            break;
+        }
+        s = tail;
+    }
+    s.to_string()
 }
 
 /// Whether `provider` is `id`'s first-party vendor, as opposed to a reseller,
@@ -89,6 +123,12 @@ fn is_first_party(provider: &str, id: &str) -> bool {
         return false;
     };
     vendors.contains(&provider)
+}
+
+/// Whether an id names a Claude model. Anthropic's cache multipliers follow the
+/// model, not the seller, so this holds for a reseller's re-listing too.
+fn is_claude(id: &str) -> bool {
+    id.to_lowercase().contains("claude")
 }
 
 fn cache_dir() -> Option<PathBuf> {
@@ -243,7 +283,7 @@ impl Pricing {
 
     /// The process-wide memoized price table (cheap Arc clone). Never blocks on
     /// disk/network — until `reload_shared` has populated the cell it returns the
-    /// built-in snapshot, so callers holding BUILD_LOCK are never stalled.
+    /// built-in snapshot, so callers holding the store lock are never stalled.
     pub fn shared() -> Arc<Pricing> {
         if let Some(lock) = PRICING.get() {
             if let Ok(g) = lock.read() {
@@ -255,7 +295,7 @@ impl Pricing {
 
     /// Load the full table (cache read + network on cold/stale cache) and swap it
     /// into the shared cell. MUST run on a background thread — never the main
-    /// thread or a BUILD_LOCK holder — since the fetch can block up to ~20s.
+    /// thread or a store-lock holder — since the fetch can block up to ~20s.
     pub fn reload_shared(force: bool) {
         let Some(p) = Pricing::load(force) else {
             return; // nothing changed — keep the current table, no re-parse, no swap
@@ -273,9 +313,18 @@ impl Pricing {
         }
     }
 
-    fn insert(&mut self, id: &str, price: ModelPrice) {
+    fn insert(&mut self, id: &str, mut price: ModelPrice) {
         if price.is_zero() {
             return;
+        }
+        // Anthropic bills a 1-hour cache write at 2x the base input price and a
+        // 5-minute one at 1.25x. Only LiteLLM publishes the 1h rate, so a
+        // models.dev entry — inserted first, and therefore the winner — would
+        // otherwise bill every cache write at the 5-minute rate. That is not a
+        // rounding error: a Claude Code session holds its prompt cache for an
+        // hour by default, so all of its cache-write tokens are 1h writes.
+        if price.cache_create_1h == 0.0 && price.input > 0.0 && is_claude(id) {
+            price.cache_create_1h = 2.0 * price.input;
         }
         self.exact.entry(id.to_string()).or_insert_with(|| price.clone());
         self.exact.entry(bare(id).to_string()).or_insert_with(|| price.clone());
@@ -299,6 +348,9 @@ impl Pricing {
                     output: g("output") / 1e6,
                     cache_create: g("cache_write") / 1e6,
                     cache_read: g("cache_read") / 1e6,
+                    // models.dev publishes a single cache-write rate (the 5-minute
+                    // one); `insert` derives the 1h rate where it applies.
+                    cache_create_1h: 0.0,
                 };
                 entries.push((prov_name.as_str(), id.clone(), price));
             }
@@ -333,6 +385,7 @@ impl Pricing {
                 output: g("output_cost_per_token"),
                 cache_create: g("cache_creation_input_token_cost"),
                 cache_read: g("cache_read_input_token_cost"),
+                cache_create_1h: g("cache_creation_input_token_cost_above_1hr"),
             };
             entries.push((id.clone(), price));
         }
@@ -342,19 +395,43 @@ impl Pricing {
         }
     }
 
+    /// Last-resort table, in USD per token: what `shared()` serves for the
+    /// moments before the background loader has fetched the real tables, and
+    /// what prices a first run with neither network nor cache. Kept to the
+    /// current flagship ids of the vendors this app's users actually run, at
+    /// their published list rates:
+    ///   - Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
+    ///     (input / output / 5m write / 1h write / cache read)
+    ///   - OpenAI: https://developers.openai.com/api/docs/pricing
     fn ingest_builtin(&mut self) {
-        let mk = |i: f64, o: f64, cc: f64, cr: f64| ModelPrice {
-            input: i,
-            output: o,
-            cache_create: cc,
-            cache_read: cr,
+        // MTok (as published) → per token
+        const M: f64 = 1e-6;
+        let mk = |i: f64, o: f64, cc5: f64, cc1: f64, cr: f64| ModelPrice {
+            input: i * M,
+            output: o * M,
+            cache_create: cc5 * M,
+            cache_read: cr * M,
+            cache_create_1h: cc1 * M,
         };
         let b: &[(&str, ModelPrice)] = &[
-            ("claude-opus-4-7", mk(5e-6, 25e-6, 6.25e-6, 0.5e-6)),
-            ("claude-opus-4-8", mk(5e-6, 25e-6, 6.25e-6, 0.5e-6)),
-            ("claude-sonnet-4-5", mk(3e-6, 15e-6, 3.75e-6, 0.3e-6)),
-            ("claude-sonnet-4-6", mk(3e-6, 15e-6, 3.75e-6, 0.3e-6)),
-            ("claude-haiku-4-5", mk(1e-6, 5e-6, 1.25e-6, 0.1e-6)),
+            ("claude-opus-5-5", mk(4.0, 20.0, 5.0, 8.0, 0.2)),
+            ("claude-opus-5", mk(5.0, 25.0, 6.25, 10.0, 0.5)),
+            ("claude-opus-4-8", mk(5.0, 25.0, 6.25, 10.0, 0.5)),
+            ("claude-opus-4-7", mk(5.0, 25.0, 6.25, 10.0, 0.5)),
+            ("claude-sonnet-5", mk(2.0, 10.0, 2.5, 4.0, 0.2)),
+            ("claude-sonnet-4-6", mk(3.0, 15.0, 3.75, 6.0, 0.3)),
+            ("claude-sonnet-4-5", mk(3.0, 15.0, 3.75, 6.0, 0.3)),
+            ("claude-haiku-4-5", mk(1.0, 5.0, 1.25, 2.0, 0.1)),
+            ("claude-fable-5-1", mk(10.0, 50.0, 12.5, 20.0, 0.25)),
+            ("claude-fable-5", mk(10.0, 50.0, 12.5, 20.0, 1.0)),
+            ("claude-mythos-5-1", mk(10.0, 50.0, 12.5, 20.0, 0.25)),
+            ("claude-mythos-5", mk(10.0, 50.0, 12.5, 20.0, 1.0)),
+            // OpenAI does not bill a separate cache write for gpt-5.5, hence the
+            // 0 — its cached input is the only cache line on the price list.
+            ("gpt-6-astra", mk(10.0, 50.0, 12.5, 0.0, 1.0)),
+            ("gpt-5.6-sol", mk(4.0, 20.0, 5.0, 0.0, 0.4)),
+            ("gpt-5.6-terra", mk(2.0, 12.0, 2.5, 0.0, 0.2)),
+            ("gpt-5.5", mk(5.0, 30.0, 0.0, 0.0, 0.5)),
         ];
         for (id, price) in b {
             self.insert(id, price.clone());
@@ -365,23 +442,48 @@ impl Pricing {
         if let Some(p) = self.exact.get(model) {
             return Some(p);
         }
-        self.norm.get(&normalize_key(model))
+        if let Some(p) = self.norm.get(&normalize_key(model)) {
+            return Some(p);
+        }
+        // Last resort: the same model under a provider-namespaced id
+        // ("anthropic.claude-opus-5", "global.openai.gpt-5.6-sol"). This runs only
+        // after an exact/normalized miss, so a deployment-specific entry that the
+        // tables actually list keeps winning.
+        let canonical = canonical_id(model);
+        if canonical != model {
+            if let Some(p) = self.exact.get(&canonical) {
+                return Some(p);
+            }
+            return self.norm.get(&normalize_key(&canonical));
+        }
+        None
     }
 
     /// Exact-or-normalized cost in USD. None = no pricing data for this model.
+    /// Cache-creation tokens arrive split by lifetime because Anthropic bills a
+    /// 1-hour cache write at 2x base input and a 5-minute one at 1.25x.
     pub fn cost(
         &self,
         model: &str,
         input: f64,
         output: f64,
-        cache_create: f64,
+        cache_create_5m: f64,
+        cache_create_1h: f64,
         cache_read: f64,
     ) -> Option<f64> {
         let p = self.lookup(model)?;
+        // A table that publishes only the 5-minute rate bills 1h writes at it,
+        // rather than silently dropping them to zero.
+        let cc1 = if p.cache_create_1h > 0.0 {
+            p.cache_create_1h
+        } else {
+            p.cache_create
+        };
         Some(
             input * p.input
                 + output * p.output
-                + cache_create * p.cache_create
+                + cache_create_5m * p.cache_create
+                + cache_create_1h * cc1
                 + cache_read * p.cache_read,
         )
     }
@@ -411,6 +513,40 @@ mod tests {
     // vendor (models.dev iterates providers in key order) must not shadow the
     // official entry — otherwise cache tokens, which dominate Claude usage, are
     // priced at zero and cost is undercounted several-fold.
+    #[test]
+    fn namespaced_and_quantized_ids_fall_back_to_the_bare_model() {
+        let json = r#"{
+            "anthropic": { "models": { "claude-opus-5": { "cost": { "input": 5, "output": 25, "cache_write": 6.25, "cache_read": 0.5 } } } },
+            "openai": { "models": { "gpt-5.6-sol": { "cost": { "input": 4, "output": 20, "cache_write": 5, "cache_read": 0.4 } } } }
+        }"#;
+        let mut p = empty();
+        p.ingest_modelsdev(json);
+        // how third-party / provider-namespaced logs spell the same model —
+        // including ids whose *model name* contains a version dot, where taking
+        // the last dot segment would grab "6-sol"/"5" instead of the model
+        for id in [
+            "anthropic.claude-opus-5",
+            "global.anthropic.claude-opus-5",
+            "claude-opus-5@4bit",
+            "global.openai.gpt-5.6-sol",
+            "openai.gpt-5.6-sol",
+            "us.openai.gpt-5.6-sol",
+            "bedrock-mantle.openai.gpt-5.6-sol",
+        ] {
+            let price = p.lookup(id).unwrap_or_else(|| panic!("{id} should resolve"));
+            assert!(price.input > 0.0, "{id} resolved to a zero price");
+        }
+        // namespaces only come off when the head is a provider word: a bare
+        // version dot must survive untouched
+        assert_eq!(canonical_id("glm-5.1"), "glm-5.1");
+        assert_eq!(canonical_id("gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(canonical_id("global.openai.gpt-5.6-sol"), "gpt-5.6-sol");
+        assert_eq!(canonical_id("qwen3.8-27b-mlx@4bit"), "qwen3.8-27b-mlx");
+        // an id that genuinely isn't in the table stays unpriced (no fuzzy match)
+        assert!(p.lookup("claude-opus-99").is_none());
+        assert!(p.lookup("qwen3.8-27b-mlx@4bit").is_none());
+    }
+
     #[test]
     fn first_party_entry_wins_over_cacheless_reseller() {
         let json = r#"{
@@ -471,5 +607,84 @@ mod tests {
         let price = p.lookup("acme-1").expect("acme-1 should be priced");
         assert!(approx(price.cache_read, 0.2e-6));
         assert!(approx(price.cache_create, 2.5e-6));
+    }
+
+    // Anthropic bills a 1-hour cache write at 2x base input (a 5-minute write is
+    // 1.25x, a cache read 0.1x). models.dev publishes only the 5-minute rate, so
+    // the 1h rate is derived; without it every cache write in a Claude Code
+    // session — which holds its prompt cache for an hour — is billed 60% short.
+    #[test]
+    fn modelsdev_derives_the_one_hour_cache_rate_for_claude() {
+        let json = r#"{
+            "anthropic": { "models": { "claude-opus-5-5": { "cost": { "input": 4, "output": 20, "cache_write": 5, "cache_read": 0.2 } } } },
+            "openai":    { "models": { "gpt-5.6-sol":     { "cost": { "input": 4, "output": 20, "cache_write": 5, "cache_read": 0.4 } } } }
+        }"#;
+        let mut p = empty();
+        p.ingest_modelsdev(json);
+        // Opus 5.5 list rates: $4 in / $20 out / $5 5m write / $8 1h write / $0.20 read
+        assert!(approx(p.cost("claude-opus-5-5", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 8.0));
+        assert!(approx(p.cost("claude-opus-5-5", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(), 5.0));
+        assert!(approx(p.cost("claude-opus-5-5", 1e6, 1e6, 0.0, 0.0, 1e6).unwrap(), 24.2));
+        // A non-Anthropic model has no 1-hour cache, so its creation tokens keep
+        // the single published rate instead of inventing a multiplier.
+        assert!(approx(p.cost("gpt-5.6-sol", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 5.0));
+    }
+
+    // LiteLLM publishes the 1h rate outright (`..._above_1hr`), and a published
+    // number beats the derivation.
+    #[test]
+    fn litellm_published_one_hour_rate_wins_over_the_derivation() {
+        let json = r#"{
+            "claude-x": { "input_cost_per_token": 5e-6, "output_cost_per_token": 2.5e-5,
+                          "cache_creation_input_token_cost": 6.25e-6,
+                          "cache_creation_input_token_cost_above_1hr": 1.1e-5,
+                          "cache_read_input_token_cost": 5e-7 }
+        }"#;
+        let mut p = empty();
+        p.ingest_litellm(json);
+        assert!(approx(p.cost("claude-x", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 11.0));
+        assert!(approx(p.cost("claude-x", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(), 6.25));
+    }
+
+    // The backstop table prices the moments right after launch and a first run with
+    // neither network nor cache, so a flagship missing from it surfaces as an
+    // unpriced model. Guards the Claude 5.x family and the OpenAI ids these users
+    // actually run, at their published list rates.
+    #[test]
+    fn builtin_table_covers_the_current_flagships() {
+        let p = Pricing::builtin_only();
+        for id in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5",
+            "claude-fable-5-1",
+            "claude-fable-5",
+            "claude-mythos-5-1",
+            "claude-mythos-5",
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.5",
+        ] {
+            let price = p
+                .lookup(id)
+                .unwrap_or_else(|| panic!("{id} is missing from the built-in table"));
+            assert!(price.input > 0.0 && price.output > 0.0, "{id} has no base rate");
+        }
+        // Anthropic's published table, end to end for the newest Opus
+        let opus55 = p.lookup("claude-opus-5-5").unwrap();
+        assert!(approx(opus55.input, 4e-6));
+        assert!(approx(opus55.output, 20e-6));
+        assert!(approx(opus55.cache_create, 5e-6));
+        assert!(approx(opus55.cache_create_1h, 8e-6));
+        assert!(approx(opus55.cache_read, 0.2e-6));
+        // Sonnet 5 is the $2/$10 tier, not the older $3/$15 one
+        let sonnet5 = p.lookup("claude-sonnet-5").unwrap();
+        assert!(approx(sonnet5.input, 2e-6) && approx(sonnet5.output, 10e-6));
     }
 }

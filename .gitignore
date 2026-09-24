@@ -14,3 +14,7 @@ public/dev-dashboard.json
 .history/
 *.log
 claude-design-files/
+
+# agent runtime state (Oh My Pi cache hint, pi background-task logs)
+.omp/
+.pi/tasks/

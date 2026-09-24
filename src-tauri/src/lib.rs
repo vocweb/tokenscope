@@ -1,4 +1,5 @@
 mod config;
+mod limits;
 mod model;
 mod parser;
 mod pricing;
@@ -11,10 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager,
+    Emitter, Manager, WindowEvent,
 };
-#[cfg(not(target_os = "macos"))]
-use tauri::WindowEvent;
 use std::time::Duration;
 use tauri_plugin_autostart::ManagerExt;
 // Positioner is only used for the non-macOS fallback; macOS positions the
@@ -47,62 +46,193 @@ fn refresh(app: &tauri::AppHandle) {
         let _ = tray.set_title(Some(label.clone()));
         let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
     }
-    check_milestones(app, &dash);
     let _ = app.emit("dashboard-updated", &dash);
 }
 
-/// Persisted 100M-token milestone snapshot. Stored in the app *data* dir so it
-/// survives app restarts, reboots, and updates (which only replace the .app
-/// bundle, never the data dir). The per-period ids let us tell a real crossing
-/// from a period reset.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct MilestoneState {
-    week_id: String,
-    week_floor: i64,
-    month_id: String,
-    month_floor: i64,
+// ── Detached window (an ordinary app window) ────────────────────────
+// `main` (from tauri.conf.json) is always the menu-bar popover: an NSPanel on
+// macOS, a borderless floating window elsewhere, toggled by the tray icon. The
+// detached window is a *second*, ordinary decorated window the user opens from
+// the tray menu — the two coexist, so a quick look at the popover never costs
+// the user the window they were working in.
+const MODE_POPOVER: &str = "popover";
+const MODE_WINDOW: &str = "window";
+
+/// Window label of the detached window. Built on demand (see
+/// ensure_detached_window) so a popover-only user never pays for a second
+/// webview.
+const DETACHED_LABEL: &str = "dashboard";
+
+/// Whether this launch opens the detached window, carried over from the last
+/// session. Read once at startup; the tray checkbox flips the live state after.
+static START_DETACHED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| load_window_mode().as_deref() == Some(MODE_WINDOW));
+
+/// Live detached-window state: whether it is open (drives the macOS activation
+/// policy and the tray checkbox) plus the checkbox handle itself, so the
+/// window's own close button can untick it.
+struct DetachedWindow {
+    open: AtomicBool,
+    check: std::sync::Mutex<Option<CheckMenuItem<tauri::Wry>>>,
 }
 
-/// 100M-token celebration tracking. `state` is the last persisted snapshot
-/// (`None` only before the very first observation ever, so the first run
-/// baselines without celebrating pre-existing usage). `active` guards against
-/// overlapping celebrations.
-struct Celebration {
-    state: std::sync::Mutex<Option<MilestoneState>>,
-    active: AtomicBool,
-}
-
-/// `~/Library/Application Support/tokenscope/milestones.json` (platform
-/// equivalent elsewhere). Deliberately the data dir, not the Caches dir the
-/// event store uses — Caches can be purged by the OS, milestones must not be.
-fn milestones_path() -> Option<std::path::PathBuf> {
+fn data_dir() -> Option<std::path::PathBuf> {
     let dir = dirs::data_dir()?.join("tokenscope");
     let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("milestones.json"))
+    Some(dir)
 }
 
-fn load_milestones() -> Option<MilestoneState> {
-    let t = std::fs::read_to_string(milestones_path()?).ok()?;
-    serde_json::from_str(&t).ok()
+/// `window-mode.json` holds the detached window's last visibility ("window" =
+/// open, "popover" = closed), so the next launch restores it.
+fn load_window_mode() -> Option<String> {
+    data_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("window-mode.json")).ok())
+        .and_then(|t| serde_json::from_str::<String>(&t).ok())
 }
 
-fn save_milestones(m: &MilestoneState) {
-    if let Some(p) = milestones_path() {
-        if let Ok(t) = serde_json::to_string(m) {
-            let _ = std::fs::write(p, t);
+fn save_window_mode(mode: &str) {
+    if let Some(dir) = data_dir() {
+        if let Ok(t) = serde_json::to_string(&mode) {
+            let _ = std::fs::write(dir.join("window-mode.json"), t);
         }
     }
 }
 
+/// Remembered geometry for window mode. A plain window that reopens somewhere
+/// random (or at the popover's tiny size) doesn't feel like a normal app, and
+/// Tauri only persists window state with the window-state plugin — so we store
+/// position + size ourselves, next to the other prefs.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct WindowGeom {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+
+fn load_window_geom() -> Option<WindowGeom> {
+    let t = std::fs::read_to_string(data_dir()?.join("window-geom.json")).ok()?;
+    serde_json::from_str(&t).ok()
+}
+
+fn save_window_geom(win: &tauri::WebviewWindow) {
+    let (Ok(pos), Ok(size)) = (win.outer_position(), win.outer_size()) else {
+        return;
+    };
+    let geom = WindowGeom {
+        x: pos.x,
+        y: pos.y,
+        w: size.width,
+        h: size.height,
+    };
+    if let Some(dir) = data_dir() {
+        if let Ok(t) = serde_json::to_string(&geom) {
+            let _ = std::fs::write(dir.join("window-geom.json"), t);
+        }
+    }
+}
+
+/// Apply the saved geometry to the detached window (no-op on first run, which
+/// keeps the builder's default size).
+fn restore_window_geom(win: &tauri::WebviewWindow) {
+    let Some(g) = load_window_geom() else {
+        return;
+    };
+    let _ = win.set_size(tauri::PhysicalSize::new(g.w, g.h));
+    let _ = win.set_position(tauri::PhysicalPosition::new(g.x, g.y));
+}
+
+/// Create the detached window on first use. Built here rather than declared in
+/// tauri.conf.json so a popover-only user never pays for a second webview; it
+/// loads the same bundle as the popover and the frontend renders the shape that
+/// matches its window label (see get_window_mode).
+fn ensure_detached_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
+    if let Some(w) = app.get_webview_window(DETACHED_LABEL) {
+        return Some(w);
+    }
+    let win = tauri::WebviewWindowBuilder::new(
+        app,
+        DETACHED_LABEL,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("Tokenscope")
+    .inner_size(400.0, 660.0)
+    .min_inner_size(360.0, 480.0)
+    .decorations(true)
+    .shadow(true)
+    .always_on_top(false)
+    .skip_taskbar(false)
+    .resizable(true)
+    .visible(false)
+    .build()
+    .ok()?;
+    restore_window_geom(&win);
+    // Closing the window hides it — the app keeps living in the menu bar — and
+    // set_detached_open unticks the tray item and remembers the geometry.
+    let w = win.clone();
+    win.on_window_event(move |e| {
+        if let WindowEvent::CloseRequested { api, .. } = e {
+            api.prevent_close();
+            set_detached_open(w.app_handle(), false);
+        }
+    });
+    Some(win)
+}
+
+fn is_detached_open(app: &tauri::AppHandle) -> bool {
+    app.try_state::<DetachedWindow>()
+        .map(|s| s.open.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+/// Open or close the detached window, keeping its mirrors in sync: the tray
+/// checkbox, the persisted preference (so the next launch restores it) and the
+/// macOS activation policy. The policy only becomes Regular while a real window
+/// is on screen, so a pure menu-bar user never gets a Dock icon.
+fn set_detached_open(app: &tauri::AppHandle, open: bool) {
+    let Some(state) = app.try_state::<DetachedWindow>() else {
+        return;
+    };
+
+    if open {
+        let Some(win) = ensure_detached_window(app) else {
+            return;
+        };
+        // Regular first: an Accessory app can show a window, but it owns no menu
+        // bar and gets no Dock icon / Cmd-Tab entry, so the window would not
+        // behave like a normal app window.
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    } else {
+        if let Some(win) = app.get_webview_window(DETACHED_LABEL) {
+            save_window_geom(&win);
+            let _ = win.hide();
+        }
+        // Back to a menu-bar–only app while no real window is open.
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    }
+
+    state.open.store(open, Ordering::SeqCst);
+    if let Ok(g) = state.check.lock() {
+        if let Some(item) = g.as_ref() {
+            let _ = item.set_checked(open);
+        }
+    }
+    save_window_mode(if open { MODE_WINDOW } else { MODE_POPOVER });
+}
+
 // ── Launch-at-login preference ──────────────────────────────────────
-// Persisted in the data dir (survives restarts/updates, like milestones). The
+// Persisted in the data dir (survives restarts/updates, like the window-mode
+// and geometry prefs). The
 // on/off toggle lives in the tray's right-click menu; on startup we reconcile
 // the OS registration to this preference rather than force-enabling every
 // launch (which silently undid a user who had turned autostart off).
 fn autostart_pref_path() -> Option<std::path::PathBuf> {
-    let dir = dirs::data_dir()?.join("tokenscope");
-    let _ = std::fs::create_dir_all(&dir);
-    Some(dir.join("autostart.json"))
+    Some(data_dir()?.join("autostart.json"))
 }
 
 fn load_autostart_pref() -> Option<bool> {
@@ -138,197 +268,6 @@ fn reconcile_autostart(app: &tauri::AppHandle) -> bool {
         let _ = mgr.disable();
     }
     pref
-}
-
-/// Current calendar-week and calendar-month identifiers, matching parser.rs's
-/// period definitions (Monday-based week, calendar month), so a stored floor is
-/// only ever compared within the same period.
-fn period_ids() -> (String, String) {
-    use chrono::Datelike;
-    let d = chrono::Local::now().date_naive();
-    let iso = d.iso_week();
-    (
-        format!("{}-W{:02}", iso.year(), iso.week()),
-        format!("{}-{:02}", d.year(), d.month()),
-    )
-}
-
-/// Decide whether to celebrate: fire if either period advanced to a higher
-/// 100M floor *within the same period*. `None` (first ever observation) never
-/// fires. A period-id mismatch means that period reset, so it re-baselines
-/// silently rather than comparing floors. Returns a single bool, so a jump
-/// across several boundaries — or week and month advancing together — is one
-/// celebration.
-fn milestone_fire(prev: Option<&MilestoneState>, cur: &MilestoneState) -> bool {
-    match prev {
-        None => false,
-        Some(p) => {
-            (p.week_id == cur.week_id && cur.week_floor > p.week_floor)
-                || (p.month_id == cur.month_id && cur.month_floor > p.month_floor)
-        }
-    }
-}
-
-/// Observe the latest totals, persist the snapshot, and celebrate on a new
-/// 100M-token milestone. We watch week ∪ month, not day: today is always within
-/// both the current week and month, so a day crossing is already implied by the
-/// month — but a calendar week can straddle a month boundary, so early in a
-/// month the week total can lead the (freshly reset) month, hence both. Because
-/// the snapshot is persisted, a crossing that happened while the app wasn't
-/// running (it reads the logs Claude writes regardless) still catches up on the
-/// next observation.
-fn check_milestones(app: &tauri::AppHandle, dash: &Dashboard) {
-    let Some(state) = app.try_state::<Celebration>() else {
-        return;
-    };
-    // total_tokens is already in millions, so a 100M milestone is total / 100.
-    let (week_id, month_id) = period_ids();
-    let cur = MilestoneState {
-        week_id,
-        week_floor: (dash.week.metrics.total_tokens / 100.0).floor() as i64,
-        month_id,
-        month_floor: (dash.month.metrics.total_tokens / 100.0).floor() as i64,
-    };
-
-    let mut g = state.state.lock().unwrap();
-    let fire = milestone_fire(g.as_ref(), &cur);
-    // Keep the persisted floors monotonic within a period: a later observation
-    // with a lower total (a transient/partial read, or two observers racing)
-    // must not regress the stored floor and re-fire the celebration on restart.
-    let mut next = cur.clone();
-    if let Some(prev) = g.as_ref() {
-        if prev.week_id == next.week_id && prev.week_floor > next.week_floor {
-            next.week_floor = prev.week_floor;
-        }
-        if prev.month_id == next.month_id && prev.month_floor > next.month_floor {
-            next.month_floor = prev.month_floor;
-        }
-    }
-    *g = Some(next.clone());
-    // Persist while still holding the lock so two observers can't interleave and
-    // write a stale snapshot over a newer one.
-    save_milestones(&next);
-    drop(g);
-    if fire {
-        celebrate(app);
-    }
-}
-
-/// Trigger the celebration overlay. Window/panel work must run on the main
-/// thread (refresh() runs on a background thread), so hop there.
-fn celebrate(app: &tauri::AppHandle) {
-    let handle = app.clone();
-    let _ = app.run_on_main_thread(move || show_celebration(&handle));
-}
-
-/// Show (or reuse) a full-screen, click-through, non-activating overlay on the
-/// primary monitor and run the confetti animation, then hide it after it plays.
-/// Must be called on the main thread.
-fn show_celebration(app: &tauri::AppHandle) {
-    let Some(state) = app.try_state::<Celebration>() else {
-        return;
-    };
-    // Skip if a celebration is already playing.
-    if state.active.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let (pos, size) = match app.primary_monitor() {
-        Ok(Some(m)) => (*m.position(), *m.size()),
-        _ => {
-            state.active.store(false, Ordering::SeqCst);
-            return;
-        }
-    };
-
-    // Whether the confetti window was reused or freshly built — only used on
-    // macOS to decide whether to (re-)apply the NSPanel attributes.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-    let existed = app.get_webview_window("confetti").is_some();
-    let win = match app.get_webview_window("confetti") {
-        Some(w) => w,
-        None => {
-            match tauri::WebviewWindowBuilder::new(
-                app,
-                "confetti",
-                tauri::WebviewUrl::App("confetti.html".into()),
-            )
-            .title("Tokenscope Celebration")
-            .inner_size(size.width as f64, size.height as f64)
-            .decorations(false)
-            .transparent(true)
-            .shadow(false)
-            .always_on_top(true)
-            .skip_taskbar(true)
-            .focused(false)
-            .resizable(false)
-            .visible(false)
-            .build()
-            {
-                Ok(w) => w,
-                Err(_) => {
-                    state.active.store(false, Ordering::SeqCst);
-                    return;
-                }
-            }
-        }
-    };
-
-    // Cover the whole primary monitor and let clicks pass through to the apps
-    // beneath — the celebration must never interrupt what the user is doing.
-    let _ = win.set_position(pos);
-    let _ = win.set_size(size);
-    let _ = win.set_ignore_cursor_events(true);
-
-    #[cfg(target_os = "macos")]
-    {
-        use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
-        #[allow(non_upper_case_globals)]
-        const NS_NONACTIVATING_PANEL: i32 = 1 << 7;
-
-        // Convert to a non-activating panel once, so it can float over apps in
-        // native fullscreen without stealing focus (same approach as the main
-        // popover). On reuse the window is already a panel.
-        if !existed {
-            if let Ok(panel) = win.to_panel() {
-                panel.set_level(25); // NSMainMenuWindowLevel (24) + 1
-                panel.set_style_mask(NS_NONACTIVATING_PANEL);
-                panel.set_collection_behaviour(
-                    NSWindowCollectionBehavior::NSWindowCollectionBehaviorMoveToActiveSpace
-                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary,
-                );
-            }
-        }
-        let _ = win.eval("window.__burst&&window.__burst()");
-        if let Ok(panel) = app.get_webview_panel("confetti") {
-            panel.show();
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = win.eval("window.__burst&&window.__burst()");
-        let _ = win.show();
-    }
-
-    // Hide once the animation has played out (emission ~2.3s + fall/fade).
-    let app2 = app.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(4200));
-        let app3 = app2.clone();
-        let _ = app2.run_on_main_thread(move || {
-            #[cfg(target_os = "macos")]
-            if let Ok(panel) = app3.get_webview_panel("confetti") {
-                panel.order_out(None);
-            }
-            #[cfg(not(target_os = "macos"))]
-            if let Some(w) = app3.get_webview_window("confetti") {
-                let _ = w.hide();
-            }
-            if let Some(st) = app3.try_state::<Celebration>() {
-                st.active.store(false, Ordering::SeqCst);
-            }
-        });
-    });
 }
 
 /// Last tray-icon rectangle (physical px: x, y, width, height), captured on tray
@@ -660,12 +599,25 @@ fn show_popover(app: &tauri::AppHandle) {
     }
 }
 
+/// The shape the *calling* window should render as: the menu-bar popover
+/// ("popover") or the detached normal window ("window"). The frontend uses it
+/// to pick an opaque background and to drop the custom popover drag region.
+#[tauri::command]
+fn get_window_mode(window: tauri::WebviewWindow) -> String {
+    if window.label() == DETACHED_LABEL {
+        MODE_WINDOW.to_string()
+    } else {
+        MODE_POPOVER.to_string()
+    }
+}
+
 #[tauri::command]
 async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
     // build_dashboard does blocking IO (reads/writes the cache, parses logs) and
-    // holds BUILD_LOCK — running it inline would block the command on the async
-    // runtime and, with a large cache, stall the UI. Hop to a blocking worker
-    // (the 30s refresh thread already runs the same work off the main thread).
+    // holds the store lock — running it inline would block the command on the
+    // async runtime and, with a large cache, stall the UI. Hop to a blocking
+    // worker (the 30s refresh thread already runs the same work off the main
+    // thread).
     let dash = tauri::async_runtime::spawn_blocking(parser::build_dashboard)
         .await
         .unwrap_or_else(|_| parser::build_dashboard());
@@ -679,7 +631,6 @@ async fn get_dashboard(app: tauri::AppHandle) -> Dashboard {
         // title isn't shown next to the icon.
         let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
     }
-    check_milestones(&app, &dash);
     dash
 }
 
@@ -748,8 +699,26 @@ pub fn dashboard_json() -> String {
     serde_json::to_string_pretty(&parser::build_dashboard()).unwrap_or_default()
 }
 
+/// Load the full price table (local cache, or network on a cold/stale cache)
+/// before building a dashboard. The app does this off-thread at startup; a
+/// one-shot caller such as `examples/dump.rs` must ask explicitly, or every
+/// model the built-in snapshot doesn't cover renders as unpriced.
+pub fn load_pricing() {
+    pricing::Pricing::reload_shared(false);
+}
+
+/// Same idea for the plan-usage windows (limits.rs).
+pub fn load_limits() {
+    limits::warm();
+}
+
 fn fmt_tokens_m(m: f64) -> String {
-    if m >= 1.0 {
+    // Several agents' usage summed can pass 1000M in a day (Oh My Pi runs an
+    // advisor on nearly every step), and a 7-character "3750.93M" doesn't fit a
+    // menu-bar item — switch unit instead.
+    if m >= 1000.0 {
+        format!("{:.2}B", m / 1000.0)
+    } else if m >= 1.0 {
         format!("{:.2}M", m)
     } else {
         let k = (m * 1000.0).round() as i64;
@@ -775,7 +744,13 @@ pub fn run() {
         // hands off to the already-running instance and exits, so the menu bar
         // never shows two icons.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            show_popover(app);
+            // The plugin runs this on its IPC worker thread, and every window
+            // path inside show_popover pokes AppKit (NSPanel order-front / NSWindow
+            // order-out), which is main-thread-only — doing it off-thread crashes
+            // inside AppKit's NSWMWindowCoordinator (EXC_BREAKPOINT). Hop to the
+            // main thread instead.
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || show_popover(&handle));
         }))
         .plugin(tauri_plugin_positioner::init())
         .plugin(tauri_plugin_autostart::init(
@@ -791,14 +766,22 @@ pub fn run() {
     builder
         .invoke_handler(tauri::generate_handler![
             get_dashboard,
+            get_window_mode,
             save_screenshot,
             begin_drag,
             refresh_pricing,
         ])
         .setup(move |app| {
-            // Menu-bar–only app: no Dock icon, runs in the background.
+            // Menu-bar–only by default: no Dock icon, runs in the background. A
+            // detached window makes it a regular app while it is open — Dock
+            // icon, Cmd-Tab, app menu — see set_detached_open, which flips the
+            // policy back the moment that window closes.
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            app.set_activation_policy(if *START_DETACHED {
+                tauri::ActivationPolicy::Regular
+            } else {
+                tauri::ActivationPolicy::Accessory
+            });
 
             // Holds the latest tray-icon rect so show_popover can anchor the panel.
             // Captured in the tray click handler on every platform — see
@@ -809,12 +792,11 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             app.manage(DragGuard(AtomicI64::new(0)));
 
-            // 100M-token celebration tracking. Load the persisted snapshot so
-            // milestones survive restarts/reboots/updates; the first run ever
-            // (no file) baselines on first observation without celebrating.
-            app.manage(Celebration {
-                state: std::sync::Mutex::new(load_milestones()),
-                active: AtomicBool::new(false),
+            // Detached-window state. The checkbox handle is filled in once the
+            // tray menu below has been built.
+            app.manage(DetachedWindow {
+                open: AtomicBool::new(false),
+                check: std::sync::Mutex::new(None),
             });
 
             // Reconcile launch-at-login with the user's saved preference. The
@@ -823,9 +805,11 @@ pub fn run() {
             // opt-out. `autostart_on` seeds the menu checkbox.
             let autostart_on = reconcile_autostart(app.handle());
 
-            // Popover behaviour. On macOS, convert the window to a non-activating
-            // NSPanel so it can float over apps in native fullscreen, and hide it
-            // on resign-key (clicking outside / switching apps) like a popover.
+            // `main` is always the popover. On macOS convert it to a
+            // non-activating NSPanel so it can float over apps in native
+            // fullscreen, and hide it on resign-key (clicking outside / switching
+            // apps) like a popover. The detached window is a separate, ordinary
+            // window created on demand (see ensure_detached_window).
             #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main") {
                 use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
@@ -877,7 +861,9 @@ pub fn run() {
                 let _ = app.emit("system-theme", system_is_dark());
             }
 
-            // Non-macOS: keep the plain window, hide on focus loss.
+            // Non-macOS: `main` stays the plain borderless popover — it hides on
+            // focus loss. The detached window is a separate, ordinary window
+            // created on demand (see ensure_detached_window).
             #[cfg(not(target_os = "macos"))]
             if let Some(win) = app.get_webview_window("main") {
                 let w = win.clone();
@@ -938,12 +924,24 @@ pub fn run() {
                 None::<&str>,
             )?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+            // Detached-window toggle. It opens/closes the second, ordinary window
+            // live — the menu-bar popover stays available either way — and the
+            // state is remembered for the next launch.
+            let detached_i = CheckMenuItem::with_id(
+                app,
+                "open-in-window",
+                "Open in Window",
+                true,
+                *START_DETACHED,
+                None::<&str>,
+            )?;
             let menu = Menu::with_items(
                 app,
                 &[
                     &open_i,
                     &refresh_i,
                     &PredefinedMenuItem::separator(app)?,
+                    &detached_i,
                     &autostart_i,
                     &PredefinedMenuItem::separator(app)?,
                     &quit_i,
@@ -1026,20 +1024,50 @@ pub fn run() {
                         let _ = autostart_i.set_checked(now_on);
                         save_autostart_pref(now_on);
                     }
-                    "quit" => app.exit(0),
+                    "open-in-window" => set_detached_open(app, !is_detached_open(app)),
+                    "quit" => {
+                        // Remember the detached window's geometry before leaving,
+                        // so the next launch reopens exactly where it was.
+                        if let Some(w) = app.get_webview_window(DETACHED_LABEL) {
+                            save_window_geom(&w);
+                        }
+                        app.exit(0)
+                    }
                     _ => {}
                 })
                 .build(app)?;
 
+            // Wire the checkbox handle into the state, then restore the last
+            // session's detached window if it was open.
+            if let Some(st) = app.try_state::<DetachedWindow>() {
+                if let Ok(mut g) = st.check.lock() {
+                    *g = Some(detached_i.clone());
+                }
+            }
+            if *START_DETACHED {
+                set_detached_open(app.handle(), true);
+            }
+
             // Load prices off the main thread (the fetch can block ~20s on a
             // cold/stale cache) and refresh once a day. build_dashboard reads the
             // memoized copy, so neither JSON parsing nor the network ever runs
-            // while BUILD_LOCK is held.
+            // while the store lock is held.
             std::thread::spawn(|| {
                 pricing::Pricing::reload_shared(false);
                 loop {
                     std::thread::sleep(Duration::from_secs(24 * 60 * 60));
                     pricing::Pricing::reload_shared(false);
+                }
+            });
+
+            // Provider-reported plan windows (opencode Go / Zen, plus whatever
+            // Oh My Pi's own poller recorded) — fetched off the main thread, since
+            // the live call can block and the panel must never wait on it.
+            std::thread::spawn(|| {
+                limits::reload_shared(false);
+                loop {
+                    std::thread::sleep(Duration::from_secs(15 * 60));
+                    limits::reload_shared(false);
                 }
             });
 
@@ -1052,12 +1080,14 @@ pub fn run() {
             });
 
             // Filesystem watcher: reflect a log write within ~1s instead of
-            // waiting up to the 30s poll (PRD wants <=5s). Writes land in
-            // ~/.claude/projects; our own cache lives elsewhere, so this never
+            // waiting up to the 30s poll (PRD wants <=5s). Writes land in the
+            // agent dirs store::watch_roots() reports (Claude Code, Codex,
+            // opencode, Oh My Pi); our own cache lives elsewhere, so this never
             // self-triggers. Debounced so a burst of writes coalesces into one
             // rebuild; the 30s poll above stays as a fallback. (build_dashboard
-            // serializes on BUILD_LOCK, so this and the poll can't race the cache.)
-            if let Some(projects) = dirs::home_dir().map(|h| h.join(".claude").join("projects")) {
+            // serializes on the store lock, so this and the poll can't race.)
+            let roots = store::watch_roots();
+            if !roots.is_empty() {
                 let handle = app.handle().clone();
                 std::thread::spawn(move || {
                     use notify::{RecursiveMode, Watcher};
@@ -1072,11 +1102,17 @@ pub fn run() {
                         Ok(w) => w,
                         Err(_) => return,
                     };
-                    // Claude Code may not have created the dir yet on a fresh
-                    // machine; create it so watch() registers instead of silently
-                    // falling back to the 30s poll for the whole session.
-                    let _ = std::fs::create_dir_all(&projects);
-                    if watcher.watch(&projects, RecursiveMode::Recursive).is_err() {
+                    // watch_roots() creates Claude Code's dir and skips missing
+                    // ones, so a failure here means the OS refused the watch —
+                    // count what registered rather than aborting the whole
+                    // watcher (one bad root would kill live updates everywhere).
+                    let mut registered = 0;
+                    for root in &roots {
+                        if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
+                            registered += 1;
+                        }
+                    }
+                    if registered == 0 {
                         return;
                     }
                     // Block for the first change, then drain the burst until quiet.
@@ -1089,67 +1125,36 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ms(wk: &str, wf: i64, mo: &str, mf: i64) -> MilestoneState {
-        MilestoneState {
-            week_id: wk.into(),
-            week_floor: wf,
-            month_id: mo.into(),
-            month_floor: mf,
-        }
-    }
-
-    #[test]
-    fn first_ever_observation_baselines_without_firing() {
-        // No prior snapshot → never celebrate pre-existing usage on first run.
-        assert!(!milestone_fire(None, &ms("2026-W24", 3, "2026-06", 3)));
-    }
-
-    #[test]
-    fn no_change_does_not_fire() {
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(!milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 3)));
-    }
-
-    #[test]
-    fn month_crossing_fires() {
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 4)));
-    }
-
-    #[test]
-    fn week_crossing_fires_even_when_month_flat() {
-        // Early in a month the week (straddling from the previous month) can lead.
-        let prev = ms("2026-W24", 0, "2026-06", 0);
-        assert!(milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 0)));
-    }
-
-    #[test]
-    fn multi_boundary_jump_is_a_single_fire() {
-        // 3 → 7 is still one celebration (fire is a bool, not a count).
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(milestone_fire(Some(&prev), &ms("2026-W24", 1, "2026-06", 7)));
-    }
-
-    #[test]
-    fn new_month_rebaselines_silently() {
-        // Period id changed → that period reset; re-baseline, don't compare floors
-        // (so a new month opening below last month's floor never fires).
-        let prev = ms("2026-W24", 1, "2026-06", 3);
-        assert!(!milestone_fire(Some(&prev), &ms("2026-W27", 0, "2026-07", 0)));
-    }
-
-    #[test]
-    fn new_week_does_not_fire_on_reset() {
-        let prev = ms("2026-W24", 2, "2026-06", 3);
-        // New week (id changed), month unchanged and flat → no fire.
-        assert!(!milestone_fire(Some(&prev), &ms("2026-W25", 0, "2026-06", 3)));
-    }
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Quitting is the one moment a cache write is worth doing regardless
+            // of the checkpoint schedule, so the next launch doesn't re-read
+            // everything logged since the last one. `flush` is a no-op when
+            // nothing is pending, so handling both events is free.
+            match event {
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => parser::flush(),
+                _ => {}
+            }
+            // macOS: clicking the Dock icon (or `open` from the command line) with
+            // no visible window should bring a window back. Which one depends on
+            // what the user had: the detached window keeps the Dock icon alive, so
+            // if it is open it is the one to restore; otherwise the popover.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
+                if !has_visible_windows {
+                    if is_detached_open(app) {
+                        set_detached_open(app, true);
+                    } else {
+                        show_popover(app);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }

@@ -43,6 +43,7 @@
 
 ### 关键处理
 - 按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
+- **Claude Code 会在响应流式生成时反复重写同一条 assistant 行**，因此一个 `message.id` 在文件里出现多次，`output_tokens` 逐次变大（实测 6 小时窗口内 647 个 id 里有 355 个末次计数高于首次，而 `input`/`cache_*` 从不变）。工具调用照常合并，**token 读数取最新一条带 usage 的行** —— 只保留首次会把每个流式响应冻结在开头那一小段，丢掉约 69% 的 output token；完全不带 usage 的行（响应尚未开始流式）不会覆盖已有读数
 - 各源 token 口径：Claude Code 直接给出四类；**Codex** 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；**opencode** 单独的 `reasoning` 计入 output；**Oh My Pi** 与 Claude Code 一致；**pi** 每条 assistant 消息带 `usage{input, output, cacheRead, cacheWrite, reasoning}`，`reasoning` 计入 output、`cacheWrite` 按 5 分钟缓存计（与 opencode 同口径）
 - **Codex** rollout 同时携带本轮 `last_token_usage` 与会话累计 `total_token_usage`，取本轮值，token 落在真实发生的小时/日期；一个 rollout 文件 = 一个会话
 - **Oh My Pi** 同一会话会拆成多个 agent 日志（`__advisor.*.jsonl`、subagent），归入同一 session，且所有 agent 的 token 都计入

@@ -73,6 +73,31 @@ fix. Newest first. Useful as a reference for similar issues.
   matches the logs, so the corrected numbers are the right ones; the inflation
   source itself is still open (cf. the re-read idempotency class in `REVIEW.md`).
 
+### 18. Claude Code's streamed output tokens were frozen at the opening chunk
+
+- **Symptom**: The **5H** view under-reported Claude Code's output tokens — on
+  this machine 0.112M recorded against 0.496M in the logs, i.e. **~69% of the
+  window's output missing**. Input and cache were exact, so the shortfall
+  showed up only as a suspiciously small "output" share and a cost that barely
+  moved. (The **provider-reported** plan-limit rows — "Claude · 5 Hour",
+  "Claude · 7 Day" — were unaffected and still live.)
+- **Cause**: Claude Code **re-appends the whole assistant line as the response
+  streams**, so one `message.id` appears repeatedly in a file with `output_tokens`
+  climbing on each copy (measured on a 6 h window: 355 of 647 ids ended above
+  their first count, while `input` / `cache_creation` / `cache_read` never
+  changed). `push_event` deduped Claude repeats by **merging tool calls and
+  keeping the first line's tokens** — correct for the case it was written for (one
+  message split across a thinking line and a `tool_use` line), but it froze every
+  streamed response at its opening chunk.
+- **Fix**: Claude repeats now merge tool calls *and* take the token reading from
+  the newest line that actually carries one (`Store::has_usage`), so an early copy
+  with no numbers never overwrites a stored reading either. Bumped
+  `STORE_VERSION` to 10 so existing caches are rebuilt from the logs.
+- **Verify**: raw-JSONL last-wins recomputation vs the store, same 5 h window —
+  output 0.112M → **0.483M** against a ground truth of 0.496M. `cargo test --lib`
+  49/49 with two new regression tests (streamed repeats take the latest reading
+  and still merge tool calls; a usage-free repeat does not erase one).
+
 ---
 
 ## Release & distribution (CI)

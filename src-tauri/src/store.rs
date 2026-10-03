@@ -155,7 +155,11 @@ pub struct Store {
 //       those as 0, so it must be rebuilt for that history to be right.
 //   v9: MCP / Skill calls are extracted from every agent's logs, not just
 //       Claude Code's (Oh My Pi and pi tool calls were dropped outright).
-const STORE_VERSION: u32 = 9;
+//   v10: Claude Code re-appends an assistant line as the response streams, so a
+//       message id repeats with a growing `output_tokens`. A v9 cache kept only
+//       the first (opening-chunk) copy, freezing ~69% of Claude Code's output
+//       tokens at zero progress; the cache must be rebuilt to recover them.
+const STORE_VERSION: u32 = 10;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -400,20 +404,48 @@ impl Store {
         self.rebuild_index();
     }
 
+    /// Whether an event carries a non-zero token reading. Claude Code streams a
+    /// message as it is generated and re-appends the whole assistant line on
+    /// every chunk, so one `message.id` can appear many times in a file. Early
+    /// copies legitimately carry no numbers at all (the response had not started
+    /// streaming yet), and those must not overwrite a stored reading.
+    fn has_usage(ev: &RawEvent) -> bool {
+        ev.in_tok > 0.0 || ev.cc > 0.0 || ev.cc_1h > 0.0 || ev.cr > 0.0 || ev.out_tok > 0.0
+    }
+
     /// Record one parsed event.
     ///
-    /// Dedup semantics differ by source, because the logs differ: Claude Code
-    /// splits one message across several lines that all share its id, so a
-    /// repeat means "same message, more tool calls" (merge, never re-count
-    /// tokens). Codex/opencode/Oh My Pi rewrite a message as it streams, so a
-    /// repeat means "same message, newer numbers" (replace).
+    /// Dedup semantics differ by source, because the logs differ. Codex/opencode/
+    /// Oh My Pi rewrite a message as it streams, so a repeat means "same message,
+    /// newer numbers" (replace).
+    ///
+    /// Claude Code is both at once: it splits one message across several lines
+    /// (thinking on one, tool_use on the next) *and* re-appends the line as the
+    /// response streams. A repeat therefore means both "more tool calls" and
+    /// "higher output count" — `output_tokens` grows monotonically with each
+    /// re-append (measured on this machine: 355 of 647 ids in a 6 h window ended
+    /// above their first count, while `input`/`cache_*` never changed). Keeping
+    /// only the first copy froze every streamed response at its opening chunk,
+    /// losing 69% of Claude Code's output tokens and the 5-hour window's output
+    /// total with them. So tool calls merge, and the token reading comes from the
+    /// newest line that actually carries one.
     fn push_event(&mut self, ev: RawEvent) {
         if !ev.id.is_empty() {
             if let Some(&i) = self.index.get(&ev.id) {
                 if ev.tool == TOOL_CLAUDE {
+                    // Read the numbers before `mcp`/`skills` move out of `ev`.
+                    let usage = Self::has_usage(&ev);
                     let prev = &mut self.events[i];
                     prev.mcp.extend(ev.mcp);
                     prev.skills.extend(ev.skills);
+                    if usage {
+                        prev.in_tok = ev.in_tok;
+                        prev.cc = ev.cc;
+                        prev.cc_1h = ev.cc_1h;
+                        prev.cr = ev.cr;
+                        prev.out_tok = ev.out_tok;
+                        prev.model = ev.model;
+                    }
                 } else {
                     self.events[i] = ev;
                 }
@@ -1569,6 +1601,81 @@ mod tests {
         ))
         .unwrap();
         assert_eq!((ev.cc, ev.cc_1h), (0.0, 1001.0));
+    }
+
+    // Claude Code re-appends the whole assistant line as the response streams,
+    // so one message id repeats with `output_tokens` climbing on each copy. The
+    // final count is the real one; the first copy is just the opening chunk.
+    #[test]
+    fn claude_streamed_repeats_take_the_latest_usage_and_still_merge_tool_calls() {
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        let mkev = |out: f64, server: Option<&str>| RawEvent {
+            ts_ms: 1,
+            session: "s1".into(),
+            model: "claude-opus-5".into(),
+            in_tok: 2.0,
+            cc: 0.0,
+            cc_1h: 0.0,
+            cr: 27405.0,
+            out_tok: out,
+            n: 1,
+            mcp: server.map(|s| vec![s.to_string()]).unwrap_or_default(),
+            skills: Vec::new(),
+            id: "m1".into(),
+            source: "/log/f.jsonl".into(),
+            tool: TOOL_CLAUDE.into(),
+        };
+        // Three re-appends of one message: 5 → 5 → 316 output tokens, the last
+        // chunk also carrying the tool_use block.
+        s.push_event(mkev(5.0, None));
+        s.push_event(mkev(5.0, None));
+        s.push_event(mkev(316.0, Some("srv")));
+
+        assert_eq!(s.events.len(), 1, "one message stays one event");
+        let e = &s.events[0];
+        assert_eq!(e.out_tok, 316.0, "the final streamed count is the real one");
+        assert_eq!((e.in_tok, e.cr), (2.0, 27405.0), "stable fields are kept");
+        assert_eq!(e.mcp, vec!["srv".to_string()], "tool calls still merge");
+    }
+
+    // A copy with no numbers at all (the response had not started streaming)
+    // must not wipe the reading already stored.
+    #[test]
+    fn claude_repeat_without_usage_does_not_erase_the_stored_reading() {
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        let mkev = |in_tok: f64, cr: f64, out: f64| RawEvent {
+            ts_ms: 1,
+            session: "s1".into(),
+            model: "claude-opus-5".into(),
+            in_tok,
+            cc: 0.0,
+            cc_1h: 0.0,
+            cr,
+            out_tok: out,
+            n: 1,
+            mcp: Vec::new(),
+            skills: Vec::new(),
+            id: "m1".into(),
+            source: "/log/f.jsonl".into(),
+            tool: TOOL_CLAUDE.into(),
+        };
+        s.push_event(mkev(2.0, 27405.0, 316.0));
+        // A trailing copy carries neither usage nor a model.
+        let mut empty = mkev(0.0, 0.0, 0.0);
+        empty.model = String::new();
+        s.push_event(empty);
+
+        let e = &s.events[0];
+        assert_eq!((e.in_tok, e.cr, e.out_tok), (2.0, 27405.0, 316.0));
+        assert_eq!(e.model, "claude-opus-5", "a model-less copy must not blank it");
     }
 
     #[test]

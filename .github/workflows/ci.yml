@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    # Frontend typecheck and Rust unit tests are platform-independent, so one
+    # runner covers both halves of the gate. The release workflow is what
+    # builds the actual bundles per platform.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend deps
+        run: pnpm install
+
+      - name: Typecheck frontend
+        run: pnpm exec tsc --noEmit
+
+      # The lib tests are the parse/aggregate suite (store, parser, pricing,
+      # config, limits). They read no user data and need no display, so they run
+      # headless here; the dev-dashboard example is deliberately not exercised
+      # because it reads the machine's real ~/.claude and ~/.omp logs.
+      - name: Test Rust library
+        run: cargo test --lib
+        working-directory: src-tauri

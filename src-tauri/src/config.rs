@@ -71,7 +71,9 @@ fn mcps_from_codex_toml(path: &Path) -> HashSet<String> {
     };
     for line in text.lines() {
         let line = line.trim();
-        let Some(inner) = line.strip_prefix("[mcp_servers.").and_then(|l| l.strip_suffix(']'))
+        let Some(inner) = line
+            .strip_prefix("[mcp_servers.")
+            .and_then(|l| l.strip_suffix(']'))
         else {
             continue;
         };
@@ -242,7 +244,10 @@ mod tests {
             c.resolve_mcp("unitymcp_manage_asset").as_deref(),
             Some("UnityMCP")
         );
-        assert_eq!(c.resolve_mcp("pencil_batch_design").as_deref(), Some("pencil"));
+        assert_eq!(
+            c.resolve_mcp("pencil_batch_design").as_deref(),
+            Some("pencil")
+        );
         // a server the user never installed is dropped (Anthropic's bundled MCP)
         assert_eq!(c.resolve_mcp("claude_ai_Figma"), None);
     }
@@ -263,14 +268,20 @@ mod tests {
     #[test]
     fn installed_skills_match_their_plugin_qualified_ids() {
         let c = cfg(&[], &["ak-debug", "advanced-skill"]);
-        assert!(c.is_user_skill("ak:debug"), "plugin id → its installed folder");
+        assert!(
+            c.is_user_skill("ak:debug"),
+            "plugin id → its installed folder"
+        );
         assert!(c.is_user_skill("ak-debug"));
         assert!(c.is_user_skill("advanced-skill"));
         assert!(
             !c.is_user_skill("advanced"),
             "the bare-name fallback must not turn a prefix into a match"
         );
-        assert!(!c.is_user_skill("ck:advise"), "not installed under any agent");
+        assert!(
+            !c.is_user_skill("ck:advise"),
+            "not installed under any agent"
+        );
     }
 
     #[test]
@@ -286,7 +297,11 @@ mod tests {
         )
         .unwrap();
         let found = mcps_from_codex_toml(&path);
-        assert_eq!(found.len(), 2, "a nested `.env` table is not a server: {found:?}");
+        assert_eq!(
+            found.len(),
+            2,
+            "a nested `.env` table is not a server: {found:?}"
+        );
         assert!(found.contains("unityMCP") && found.contains("pencil"));
         let _ = fs::remove_dir_all(&dir);
     }

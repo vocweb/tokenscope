@@ -37,7 +37,10 @@ use std::fs;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, RwLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, LazyLock, RwLock,
+};
 use std::time::Duration;
 
 use crate::store::opencode_data_dir;
@@ -57,7 +60,7 @@ pub struct UsageLimit {
     /// Window name as the provider/UI labels it ("5 Hour", "Weekly", "Monthly").
     pub window: String,
     pub label: String,
-    pub used: f64, // percent 0..100
+    pub used: f64,      // percent 0..100
     pub status: String, // ok | warning | exhausted | rate-limited
     #[serde(rename = "resetsAt")]
     pub resets_at_ms: i64,
@@ -101,7 +104,10 @@ fn should_skip(cached: Option<&Cached>, force: bool, now_ms: i64) -> bool {
             if !c.live_ok {
                 return false;
             }
-            if c.items.iter().any(|i| i.resets_at_ms > 0 && i.resets_at_ms <= now_ms) {
+            if c.items
+                .iter()
+                .any(|i| i.resets_at_ms > 0 && i.resets_at_ms <= now_ms)
+            {
                 return false;
             }
             (0..FRESH.as_millis() as i64).contains(&(now_ms - c.fetched_at))
@@ -269,7 +275,10 @@ fn fetch_opencode_go(key: &str) -> Option<Vec<UsageLimit>> {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[tokenscope limits] {}", http_err("opencode-go usage fetch failed", e));
+            eprintln!(
+                "[tokenscope limits] {}",
+                http_err("opencode-go usage fetch failed", e)
+            );
             return None;
         }
     };
@@ -294,9 +303,7 @@ fn claude_access_token(raw: &str) -> Option<String> {
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
     };
-    v.get("claudeAiOauth")
-        .and_then(pick)
-        .or_else(|| pick(&v))
+    v.get("claudeAiOauth").and_then(pick).or_else(|| pick(&v))
 }
 
 /// Service names of Claude Code's keychain credential items, most likely first.
@@ -327,7 +334,9 @@ fn keychain_credential_services() -> Vec<String> {
         let Some(rest) = line.trim().strip_prefix("\"svce\"<blob>=\"") else {
             continue;
         };
-        let Some(svce) = rest.strip_suffix('"') else { continue };
+        let Some(svce) = rest.strip_suffix('"') else {
+            continue;
+        };
         if svce.starts_with(SERVICE) && !found.contains(&svce.to_string()) {
             found.push(svce.to_string());
         }
@@ -574,8 +583,7 @@ fn log_unknown_claude_windows(v: &serde_json::Value) {
     let mut unknown: Vec<&str> = obj
         .iter()
         .filter(|(k, w)| {
-            !KNOWN.contains(&k.as_str())
-                && w.get("utilization").and_then(|u| u.as_f64()).is_some()
+            !KNOWN.contains(&k.as_str()) && w.get("utilization").and_then(|u| u.as_f64()).is_some()
         })
         .map(|(k, _)| k.as_str())
         .collect();
@@ -598,7 +606,10 @@ fn fetch_claude(token: &str) -> Option<Vec<UsageLimit>> {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[tokenscope limits] {}", http_err("claude usage fetch failed", e));
+            eprintln!(
+                "[tokenscope limits] {}",
+                http_err("claude usage fetch failed", e)
+            );
             return None;
         }
     };
@@ -882,7 +893,8 @@ mod tests {
     fn an_access_token_is_read_from_every_credential_shape() {
         // Claude Code's file and its keychain item.
         assert_eq!(
-            claude_access_token(r#"{"claudeAiOauth":{"accessToken":" sk-ant-oat01-x "}}"#).as_deref(),
+            claude_access_token(r#"{"claudeAiOauth":{"accessToken":" sk-ant-oat01-x "}}"#)
+                .as_deref(),
             Some("sk-ant-oat01-x")
         );
         // Oh My Pi's auth_credentials row.
@@ -891,8 +903,14 @@ mod tests {
             Some("sk-ant-oat01-y")
         );
         // Empty, absent and non-JSON documents yield no token.
-        assert_eq!(claude_access_token(r#"{"claudeAiOauth":{"accessToken":"  "}}"#), None);
-        assert_eq!(claude_access_token(r#"{"claudeAiOauth":{"scopes":[]}}"#), None);
+        assert_eq!(
+            claude_access_token(r#"{"claudeAiOauth":{"accessToken":"  "}}"#),
+            None
+        );
+        assert_eq!(
+            claude_access_token(r#"{"claudeAiOauth":{"scopes":[]}}"#),
+            None
+        );
         assert_eq!(claude_access_token("not json"), None);
     }
 
@@ -912,14 +930,15 @@ mod tests {
         );
         assert_eq!(items[0].used, 16.0);
         assert_eq!(items[1].used, 32.0);
-        assert!(items.iter().all(|i| i.provider == "opencode-go" && i.source == "api"));
+        assert!(items
+            .iter()
+            .all(|i| i.provider == "opencode-go" && i.source == "api"));
         assert_eq!(items[0].resets_at_ms, 1790167360263); // 2026-09-23T12:42:40.263Z
         assert!(items.iter().all(|i| i.observed_ms == 42));
         // an envelope without the windows is not a snapshot
         assert!(parse_opencode_usage(&serde_json::json!({"error":"nope"}), 1).is_none());
         // a window missing `percent` is dropped (percent is the whole point)
-        let partial =
-            serde_json::json!({"usage":{"rolling":{"status":"ok","percent":5,"resetsAt":"2026-09-23T12:42:40Z"},
+        let partial = serde_json::json!({"usage":{"rolling":{"status":"ok","percent":5,"resetsAt":"2026-09-23T12:42:40Z"},
                                          "weekly":{"status":"ok"}}});
         let items = parse_opencode_usage(&partial, 1).unwrap();
         assert_eq!(items.len(), 1);
@@ -955,7 +974,10 @@ mod tests {
         let week = items.iter().find(|i| i.label == "Claude 7 Day").unwrap();
         assert_eq!(week.used, 27.0);
         assert_eq!(week.status, "ok");
-        let fable = items.iter().find(|i| i.label == "Claude 7 Day (Fable)").unwrap();
+        let fable = items
+            .iter()
+            .find(|i| i.label == "Claude 7 Day (Fable)")
+            .unwrap();
         assert_eq!(fable.window, "7 Day");
         assert_eq!(fable.used, 0.0);
         // no recognizable window at all → not a snapshot
@@ -1145,8 +1167,14 @@ mod tests {
         // dump succeeded: persisted names already covered are not duplicated,
         // unknown persisted ones are kept as fallback.
         let out = union_services(
-            vec!["Claude Code-credentials".into(), "Claude Code-credentials-1".into()],
-            vec!["Claude Code-credentials".into(), "Claude Code-credentials-9".into()],
+            vec![
+                "Claude Code-credentials".into(),
+                "Claude Code-credentials-1".into(),
+            ],
+            vec![
+                "Claude Code-credentials".into(),
+                "Claude Code-credentials-9".into(),
+            ],
         );
         assert_eq!(
             out,

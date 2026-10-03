@@ -50,9 +50,9 @@ pub struct RawEvent {
     /// compacted day row carries however many it summed.
     #[serde(default = "one")]
     pub n: u64,
-    pub mcp: Vec<String>,    // server candidates of this row's tool calls (unfiltered)
+    pub mcp: Vec<String>, // server candidates of this row's tool calls (unfiltered)
     pub skills: Vec<String>, // skill ids called in this row (unfiltered)
-    pub id: String,          // message id (dedup)
+    pub id: String,       // message id (dedup)
     // Source log file (manifest key). Lets a truncated/rewritten file purge its
     // own stale events before being re-read, so re-ingestion stays idempotent.
     #[serde(default)]
@@ -104,8 +104,8 @@ const AGG_PREFIX: &str = "agg:";
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct FileState {
     model: String,
-    seq: u64,       // emitted-event counter, used to build stable ids
-    tot: [u64; 4],  // last cumulative (input, cached, output, reasoning)
+    seq: u64,      // emitted-event counter, used to build stable ids
+    tot: [u64; 4], // last cumulative (input, cached, output, reasoning)
     /// Codex logs a tool call (`response_item`/`function_call`) on its own line,
     /// before the `token_count` event that carries the usage, so names seen
     /// since the last emitted event are held here and attached to the next one.
@@ -212,7 +212,9 @@ fn opencode_paths() -> Option<(PathBuf, PathBuf)> {
 /// ~/.omp/profiles/<name>/agent. Sessions live under <agent>/sessions/<project>/
 /// as either <iso>_<uuid>.jsonl (single agent) or <iso>_<uuid>/<agent>.jsonl.
 fn omp_session_roots() -> Vec<PathBuf> {
-    let Some(home) = home() else { return Vec::new() };
+    let Some(home) = home() else {
+        return Vec::new();
+    };
     let base = home.join(".omp");
     let mut roots = vec![base.join("agent").join("sessions")];
     if let Ok(entries) = fs::read_dir(base.join("profiles")) {
@@ -700,9 +702,8 @@ impl Store {
                 .collect();
             for path in paths {
                 let session = omp_session_from_path(&path);
-                dirty |= self.scan_jsonl(&path, TOOL_OMP, &mut |v, _st| {
-                    parse_omp_line(v, &session)
-                });
+                dirty |=
+                    self.scan_jsonl(&path, TOOL_OMP, &mut |v, _st| parse_omp_line(v, &session));
             }
         }
         dirty
@@ -728,9 +729,7 @@ impl Store {
             .collect();
         for path in paths {
             let session = pi_session_from_path(&path);
-            dirty |= self.scan_jsonl(&path, TOOL_PI, &mut |v, _st| {
-                parse_pi_message(v, &session)
-            });
+            dirty |= self.scan_jsonl(&path, TOOL_PI, &mut |v, _st| parse_pi_message(v, &session));
         }
         dirty
     }
@@ -772,11 +771,19 @@ impl Store {
                     continue;
                 }
             }
-            if self.manifest.files.get(&key).map(|f| f.0 > size).unwrap_or(false) {
+            if self
+                .manifest
+                .files
+                .get(&key)
+                .map(|f| f.0 > size)
+                .unwrap_or(false)
+            {
                 // shrunk/rewritten → drop what we had for this file first
                 self.purge_source(&key);
             }
-            self.manifest.files.insert(key.clone(), (size, mtime_ms, size));
+            self.manifest
+                .files
+                .insert(key.clone(), (size, mtime_ms, size));
             dirty = true;
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
@@ -998,7 +1005,10 @@ fn parse_user_command(v: &serde_json::Value) -> Option<RawEvent> {
 
 fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
     let msg = v.get("message")?;
-    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown");
+    let model = msg
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("unknown");
     if model == "<synthetic>" {
         return None;
     }
@@ -1079,11 +1089,7 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
 ///     per-request delta; `total_token_usage` is cumulative for the session)
 /// Codex counts cached input *inside* input_tokens, so the uncached share is
 /// the difference — mapping it the other way would double-count the cache.
-fn parse_codex_line(
-    v: &serde_json::Value,
-    st: &mut FileState,
-    session: &str,
-) -> Option<RawEvent> {
+fn parse_codex_line(v: &serde_json::Value, st: &mut FileState, session: &str) -> Option<RawEvent> {
     let kind = v.get("type")?.as_str()?;
     if kind == "turn_context" {
         if let Some(m) = v.pointer("/payload/model").and_then(|m| m.as_str()) {
@@ -1160,7 +1166,11 @@ fn parse_codex_line(
         cr: cached as f64,
         out_tok: output as f64,
         n: 1,
-        mcp: st.pending.drain(..).filter_map(|n| mcp_candidate(&n)).collect(),
+        mcp: st
+            .pending
+            .drain(..)
+            .filter_map(|n| mcp_candidate(&n))
+            .collect(),
         skills: Vec::new(), // codex logs no skill invocation, only tool calls
         // Ids are scoped to the *session*, not the file: the same conversation
         // can be mirrored into several profile dirs, and it must still count once.
@@ -1192,7 +1202,11 @@ fn parse_omp_line(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
         .get("timestamp")
         .and_then(|t| t.as_i64())
         .or_else(|| v.get("timestamp").and_then(|t| t.as_i64()))
-        .or_else(|| v.get("timestamp").and_then(|t| t.as_str()).and_then(now_ms_from_rfc3339))?;
+        .or_else(|| {
+            v.get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(now_ms_from_rfc3339)
+        })?;
     // Oh My Pi reports the 1-hour share of its cache writes as
     // `usage.cttl.ephemeral1h` (its own `cost.cacheWrite` already bills it at the
     // 1-hour rate).
@@ -1276,14 +1290,11 @@ fn parse_pi_message(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
         return None;
     }
     let u = m.get("usage")?;
-    let ts_ms = m
-        .get("timestamp")
-        .and_then(|t| t.as_i64())
-        .or_else(|| {
-            v.get("timestamp")
-                .and_then(|t| t.as_str())
-                .and_then(now_ms_from_rfc3339)
-        })?;
+    let ts_ms = m.get("timestamp").and_then(|t| t.as_i64()).or_else(|| {
+        v.get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(now_ms_from_rfc3339)
+    })?;
     let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
     if id.is_empty() {
         return None;
@@ -1407,8 +1418,14 @@ mod tests {
             skill_from_tool_call("read", Some(&args("skill://ak:plan/references/x.md"))),
             None
         );
-        assert_eq!(skill_from_tool_call("bash", Some(&args("skill://ak:debug"))), None);
-        assert_eq!(skill_from_tool_call("read", Some(&args("src/main.rs"))), None);
+        assert_eq!(
+            skill_from_tool_call("bash", Some(&args("skill://ak:debug"))),
+            None
+        );
+        assert_eq!(
+            skill_from_tool_call("read", Some(&args("src/main.rs"))),
+            None
+        );
     }
 
     #[test]
@@ -1539,9 +1556,7 @@ mod tests {
     #[test]
     fn codex_deltas_cumulative_totals_when_no_per_turn_usage() {
         let mut st = FileState::default();
-        let ev = |v: &serde_json::Value, st: &mut FileState| {
-            parse_codex_line(v, st, "s").unwrap()
-        };
+        let ev = |v: &serde_json::Value, st: &mut FileState| parse_codex_line(v, st, "s").unwrap();
         let mk = |i: u64, c: u64, o: u64| {
             serde_json::json!({
                 "timestamp": "2026-09-03T15:29:47.868Z",
@@ -1675,7 +1690,10 @@ mod tests {
 
         let e = &s.events[0];
         assert_eq!((e.in_tok, e.cr, e.out_tok), (2.0, 27405.0, 316.0));
-        assert_eq!(e.model, "claude-opus-5", "a model-less copy must not blank it");
+        assert_eq!(
+            e.model, "claude-opus-5",
+            "a model-less copy must not blank it"
+        );
     }
 
     #[test]
@@ -1714,7 +1732,9 @@ mod tests {
 
     #[test]
     fn pi_counts_a_full_assistant_turn() {
-        let v = line(r#"{"type":"message","id":"848c5ae5","parentId":"239c9874","timestamp":"2026-09-24T00:40:55.857Z","message":{"role":"assistant","provider":"opencode-go","model":"deepseek-v4.1-flash","api":"openai-completions","timestamp":1790260855000,"usage":{"input":1755,"output":267,"cacheRead":65024,"cacheWrite":0,"reasoning":16,"totalTokens":67046},"content":[]}}"#);
+        let v = line(
+            r#"{"type":"message","id":"848c5ae5","parentId":"239c9874","timestamp":"2026-09-24T00:40:55.857Z","message":{"role":"assistant","provider":"opencode-go","model":"deepseek-v4.1-flash","api":"openai-completions","timestamp":1790260855000,"usage":{"input":1755,"output":267,"cacheRead":65024,"cacheWrite":0,"reasoning":16,"totalTokens":67046},"content":[]}}"#,
+        );
         let ev = parse_pi_message(&v, "01a0cf0b").expect("assistant turn with usage");
         assert_eq!(ev.ts_ms, 1790260855000); // inner message ts wins
         assert_eq!(ev.model, "deepseek-v4.1-flash");
@@ -1742,9 +1762,7 @@ mod tests {
     #[test]
     fn pi_session_comes_from_the_filename_uuid() {
         assert_eq!(
-            pi_session_from_path(Path::new(
-                "/x/2026-09-23T16-13-56-081Z_01a0cf0b-8df1.jsonl"
-            )),
+            pi_session_from_path(Path::new("/x/2026-09-23T16-13-56-081Z_01a0cf0b-8df1.jsonl")),
             "01a0cf0b-8df1"
         );
     }
@@ -1852,7 +1870,11 @@ mod tests {
         // Streaming completes: the row is rewritten in place with bigger numbers.
         put("msg_a", 99, &data(6, 900));
         assert!(s.ingest_opencode_db_at(&db));
-        assert_eq!(s.events.len(), 2, "an updated row must replace, not duplicate");
+        assert_eq!(
+            s.events.len(),
+            2,
+            "an updated row must replace, not duplicate"
+        );
         let a2 = s.events.iter().find(|e| e.id == "oc:msg_a").unwrap();
         assert_eq!(a2.out_tok, 903.0);
 
@@ -1917,7 +1939,10 @@ mod tests {
         assert_eq!(agg.mcp.len(), 2); // so do the MCP call lists
         assert_eq!(agg.ts_ms, at(yesterday, 0)); // stamped at local midnight
         assert_eq!(agg.session, "s1");
-        assert!(s.events.iter().any(|e| e.id == "c" && e.ts_ms == at(today, 1)));
+        assert!(s
+            .events
+            .iter()
+            .any(|e| e.id == "c" && e.ts_ms == at(today, 1)));
 
         // Re-running must be a no-op, not a second fold into the same row.
         assert!(!s.compact(today));
@@ -1944,13 +1969,15 @@ mod tests {
 
     #[test]
     fn session_key_groups_every_agent_file_of_one_conversation() {
-        let main = Path::new(
-            "/Users/x/.omp/agent/sessions/-proj/2026-09-23T10-36-49-393Z_01a0cdd6.jsonl",
-        );
+        let main =
+            Path::new("/Users/x/.omp/agent/sessions/-proj/2026-09-23T10-36-49-393Z_01a0cdd6.jsonl");
         let sub = Path::new(
             "/Users/x/.omp/profiles/deepseek/agent/sessions/-proj/2026-09-23T10-36-49-393Z_01a0cdd6/__advisor.scout.jsonl",
         );
-        assert_eq!(omp_session_from_path(main), "2026-09-23T10-36-49-393Z_01a0cdd6");
+        assert_eq!(
+            omp_session_from_path(main),
+            "2026-09-23T10-36-49-393Z_01a0cdd6"
+        );
         assert_eq!(omp_session_from_path(main), omp_session_from_path(sub));
     }
 }

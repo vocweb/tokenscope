@@ -8,13 +8,13 @@ mod store;
 use model::Dashboard;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, WindowEvent,
 };
-use std::time::Duration;
 use tauri_plugin_autostart::ManagerExt;
 // Positioner is only used for the non-macOS fallback; macOS positions the
 // NSPanel manually (see position_panel).
@@ -543,7 +543,9 @@ fn system_is_dark() -> bool {
         if raw.is_null() {
             return false;
         }
-        CStr::from_ptr(raw).to_string_lossy().eq_ignore_ascii_case("dark")
+        CStr::from_ptr(raw)
+            .to_string_lossy()
+            .eq_ignore_ascii_case("dark")
     }
 }
 
@@ -698,7 +700,8 @@ fn refresh_limits_bg(app: &tauri::AppHandle) {
         if now - prev < FORCE_COOLDOWN_MS {
             return;
         }
-        match LAST_LIMITS_FORCE_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed) {
+        match LAST_LIMITS_FORCE_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        {
             Ok(_) => break,
             Err(_) => continue,
         }
@@ -724,8 +727,8 @@ fn save_screenshot(data_url: String) -> Result<String, String> {
         .decode(body.trim())
         .map_err(|e| format!("invalid base64: {e}"))?;
 
-    let dir = dirs::desktop_dir()
-        .ok_or_else(|| "could not resolve the Desktop directory".to_string())?;
+    let dir =
+        dirs::desktop_dir().ok_or_else(|| "could not resolve the Desktop directory".to_string())?;
     let stamp = chrono::Local::now().format("Tokenscope %Y-%m-%d at %H.%M.%S.png");
     let path = dir.join(stamp.to_string());
 

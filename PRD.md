@@ -135,7 +135,7 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
 ### 3.4 数据采集策略
 - 监听上述所有数据源目录的文件变化（fs.watch / FSEvents），写入后 ~1s 内刷新；30s 轮询兜底
 - 增量解析新增行（按文件 size/mtime/offset manifest），避免全量重读；SQLite 源按 `time_updated` 水位线增量读取
-- 按 message id 去重：Claude Code 的同一消息可能跨多行（合并其 tool_use，token 只计一次）；Codex / opencode / Oh My Pi 会在流式过程中改写同一条消息（以最新一次为准）
+- 按 message id 去重：Claude Code 的同一消息可能跨多行，且流式生成时会反复重写整条行、`output_tokens` 逐次变大（合并其 tool_use，token 读数取最新一条带 usage 的行）；Codex / opencode / Oh My Pi 会在流式过程中改写同一条消息（以最新一次为准）
 - 本地持久化（Caches 目录下的本地 JSON），加速重启与历史查询；仅保留最近 ~26 周
 - **落盘节奏与刷新解耦**：内存中保留一份解析结果，刷新只做增量 ingest；缓存**每 15 分钟**落盘一次，外加进程内首次变更与退出时各一次 —— 而不是每次刷新都重写整份缓存。刷新由日志写入驱动（可能每秒 1~2 次），每次刷新重写 4 MB 缓存会把写入量放大到每天数 GB，触发 macOS 的 per-process disk-writes 限额后刷新线程卡在 `write()` 中，面板彻底停止更新。落盘时同时清理已删除日志文件的 manifest 条目，避免 manifest 无限增长
 

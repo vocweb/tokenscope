@@ -18,10 +18,10 @@ const MODELSDEV_URL: &str = "https://models.dev/api.json";
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
 const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60); // 24h
-// Bundled LiteLLM price table snapshot — offline fallback so a first launch
-// with no network (and no prior cache) still prices the common third-party
-// models, not just the few hardcoded in `ingest_builtin`. Live sources, when
-// reachable, are ingested first and win.
+                                                             // Bundled LiteLLM price table snapshot — offline fallback so a first launch
+                                                             // with no network (and no prior cache) still prices the common third-party
+                                                             // models, not just the few hardcoded in `ingest_builtin`. Live sources, when
+                                                             // reachable, are ingested first and win.
 const LITELLM_SNAPSHOT: &str = include_str!("../snapshots/litellm.json");
 
 #[derive(Clone, Default)]
@@ -39,7 +39,10 @@ pub struct ModelPrice {
 
 impl ModelPrice {
     fn is_zero(&self) -> bool {
-        self.input == 0.0 && self.output == 0.0 && self.cache_create == 0.0 && self.cache_read == 0.0
+        self.input == 0.0
+            && self.output == 0.0
+            && self.cache_create == 0.0
+            && self.cache_read == 0.0
     }
 }
 
@@ -64,10 +67,39 @@ fn bare(s: &str) -> &str {
 /// provider path, and Oh My Pi logs those verbatim ("global.openai.gpt-5.6-sol",
 /// "anthropic.claude-opus-5", "bedrock-mantle.openai.gpt-5.5").
 const PROVIDER_SEGMENTS: &[&str] = &[
-    "global", "us", "eu", "jp", "au", "ca", "sa", "ap", "apac", "us-gov", "gov", "anthropic",
-    "openai", "google", "gemini", "meta", "mistral", "xai", "deepseek", "qwen", "moonshot",
-    "minimax", "bedrock", "bedrock-mantle", "azure", "azure-anthropic", "aws-bedrock", "vertex",
-    "vertex-anthropic", "amazon", "aws", "amazon-bedrock", "microsoft",
+    "global",
+    "us",
+    "eu",
+    "jp",
+    "au",
+    "ca",
+    "sa",
+    "ap",
+    "apac",
+    "us-gov",
+    "gov",
+    "anthropic",
+    "openai",
+    "google",
+    "gemini",
+    "meta",
+    "mistral",
+    "xai",
+    "deepseek",
+    "qwen",
+    "moonshot",
+    "minimax",
+    "bedrock",
+    "bedrock-mantle",
+    "azure",
+    "azure-anthropic",
+    "aws-bedrock",
+    "vertex",
+    "vertex-anthropic",
+    "amazon",
+    "aws",
+    "amazon-bedrock",
+    "microsoft",
 ];
 
 /// Reduce a logged model id to the name the price tables index and the UI groups
@@ -323,22 +355,32 @@ impl Pricing {
         if price.cache_create_1h == 0.0 && price.input > 0.0 && is_claude(id) {
             price.cache_create_1h = 2.0 * price.input;
         }
-        self.exact.entry(id.to_string()).or_insert_with(|| price.clone());
-        self.exact.entry(bare(id).to_string()).or_insert_with(|| price.clone());
+        self.exact
+            .entry(id.to_string())
+            .or_insert_with(|| price.clone());
+        self.exact
+            .entry(bare(id).to_string())
+            .or_insert_with(|| price.clone());
         self.norm.entry(normalize_key(id)).or_insert(price);
     }
 
     // models.dev: { provider: { models: { id: { cost: {input,output,cache_read,cache_write} } } } }
     // cost is per-1M tokens → divide by 1e6 for per-token.
     fn ingest_modelsdev(&mut self, text: &str) {
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { return };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+            return;
+        };
         let Some(root) = json.as_object() else { return };
         // gather (provider, id, price)
         let mut entries: Vec<(&str, String, ModelPrice)> = Vec::new();
         for (prov_name, prov) in root {
-            let Some(models) = prov.get("models").and_then(|m| m.as_object()) else { continue };
+            let Some(models) = prov.get("models").and_then(|m| m.as_object()) else {
+                continue;
+            };
             for (id, m) in models {
-                let Some(c) = m.get("cost").and_then(|c| c.as_object()) else { continue };
+                let Some(c) = m.get("cost").and_then(|c| c.as_object()) else {
+                    continue;
+                };
                 let g = |k: &str| c.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let price = ModelPrice {
                     input: g("input") / 1e6,
@@ -371,7 +413,9 @@ impl Pricing {
 
     // LiteLLM: { key: { input_cost_per_token, output_cost_per_token, ... } } — already per-token.
     fn ingest_litellm(&mut self, text: &str) {
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else { return };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+            return;
+        };
         let Some(root) = json.as_object() else { return };
         let mut entries: Vec<(String, ModelPrice)> = Vec::new();
         for (id, m) in root {
@@ -535,7 +579,9 @@ mod tests {
             "us.openai.gpt-5.6-sol",
             "bedrock-mantle.openai.gpt-5.6-sol",
         ] {
-            let price = p.lookup(id).unwrap_or_else(|| panic!("{id} should resolve"));
+            let price = p
+                .lookup(id)
+                .unwrap_or_else(|| panic!("{id} should resolve"));
             assert!(price.input > 0.0, "{id} resolved to a zero price");
         }
         // namespaces only come off when the head is a provider word: a bare
@@ -624,12 +670,24 @@ mod tests {
         let mut p = empty();
         p.ingest_modelsdev(json);
         // Opus 5.5 list rates: $4 in / $20 out / $5 5m write / $8 1h write / $0.20 read
-        assert!(approx(p.cost("claude-opus-5-5", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 8.0));
-        assert!(approx(p.cost("claude-opus-5-5", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(), 5.0));
-        assert!(approx(p.cost("claude-opus-5-5", 1e6, 1e6, 0.0, 0.0, 1e6).unwrap(), 24.2));
+        assert!(approx(
+            p.cost("claude-opus-5-5", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(),
+            8.0
+        ));
+        assert!(approx(
+            p.cost("claude-opus-5-5", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(),
+            5.0
+        ));
+        assert!(approx(
+            p.cost("claude-opus-5-5", 1e6, 1e6, 0.0, 0.0, 1e6).unwrap(),
+            24.2
+        ));
         // A non-Anthropic model has no 1-hour cache, so its creation tokens keep
         // the single published rate instead of inventing a multiplier.
-        assert!(approx(p.cost("gpt-5.6-sol", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 5.0));
+        assert!(approx(
+            p.cost("gpt-5.6-sol", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(),
+            5.0
+        ));
     }
 
     // LiteLLM publishes the 1h rate outright (`..._above_1hr`), and a published
@@ -644,8 +702,14 @@ mod tests {
         }"#;
         let mut p = empty();
         p.ingest_litellm(json);
-        assert!(approx(p.cost("claude-x", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 11.0));
-        assert!(approx(p.cost("claude-x", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(), 6.25));
+        assert!(approx(
+            p.cost("claude-x", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(),
+            11.0
+        ));
+        assert!(approx(
+            p.cost("claude-x", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(),
+            6.25
+        ));
     }
 
     // The backstop table prices the moments right after launch and a first run with
@@ -676,7 +740,10 @@ mod tests {
             let price = p
                 .lookup(id)
                 .unwrap_or_else(|| panic!("{id} is missing from the built-in table"));
-            assert!(price.input > 0.0 && price.output > 0.0, "{id} has no base rate");
+            assert!(
+                price.input > 0.0 && price.output > 0.0,
+                "{id} has no base rate"
+            );
         }
         // Anthropic's published table, end to end for the newest Opus
         let opus55 = p.lookup("claude-opus-5-5").unwrap();
@@ -690,4 +757,3 @@ mod tests {
         assert!(approx(sonnet5.input, 2e-6) && approx(sonnet5.output, 10e-6));
     }
 }
-

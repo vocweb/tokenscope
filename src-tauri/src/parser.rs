@@ -41,13 +41,13 @@ struct Event {
     session: String,
     tool: String, // source CLI (TOOL_*) — the by-agent breakdown
     model: String,
-    input: f64,  // raw tokens, uncached new input only
-    cache: f64,  // raw tokens, cache creation + read
-    output: f64, // raw tokens
-    cost: f64,   // USD (differentiated by token type), 0 if unknown model
-    priced: bool, // whether a price was found for this model
-    n: u64,      // API requests this row represents (1, or a compacted day's sum)
-    mcp: Vec<String>,   // user-installed server names called in this msg
+    input: f64,          // raw tokens, uncached new input only
+    cache: f64,          // raw tokens, cache creation + read
+    output: f64,         // raw tokens
+    cost: f64,           // USD (differentiated by token type), 0 if unknown model
+    priced: bool,        // whether a price was found for this model
+    n: u64,              // API requests this row represents (1, or a compacted day's sum)
+    mcp: Vec<String>,    // user-installed server names called in this msg
     skills: Vec<String>, // user-installed skill names called in this msg
 }
 
@@ -335,7 +335,12 @@ impl Agg {
                     vendor: vendor_of(&name).to_string(),
                     tokens: (tok / 1e6 * 100.0).round() / 100.0,
                     cost: (cost * 100.0).round() / 100.0,
-                    color: if i < PALETTE.len() { PALETTE[i] } else { OVERFLOW_GRAY }.to_string(),
+                    color: if i < PALETTE.len() {
+                        PALETTE[i]
+                    } else {
+                        OVERFLOW_GRAY
+                    }
+                    .to_string(),
                     priced,
                     name,
                 }
@@ -356,10 +361,19 @@ impl Agg {
                 tokens: (t / 1e6 * 100.0).round() / 100.0,
                 cost: (self.tool_cost.get(k).unwrap_or(&0.0) * 100.0).round() / 100.0,
                 requests: *self.tool_req.get(k).unwrap_or(&0),
-                sessions: self.tool_sessions.get(k).map(|s| s.len() as u64).unwrap_or(0),
+                sessions: self
+                    .tool_sessions
+                    .get(k)
+                    .map(|s| s.len() as u64)
+                    .unwrap_or(0),
             })
             .collect();
-        v.sort_by_key(|t| TOOL_ORDER.iter().position(|x| *x == t.name).unwrap_or(usize::MAX));
+        v.sort_by_key(|t| {
+            TOOL_ORDER
+                .iter()
+                .position(|x| *x == t.name)
+                .unwrap_or(usize::MAX)
+        });
         v
     }
 
@@ -508,7 +522,12 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
             let wd = weekday[i];
             SeriesPoint {
                 label: wd.to_string(),
-                full: format!("{} {} {}", wd, MONTHS[(date.month() - 1) as usize], date.day()),
+                full: format!(
+                    "{} {} {}",
+                    wd,
+                    MONTHS[(date.month() - 1) as usize],
+                    date.day()
+                ),
                 input: buckets[i].0,
                 cache: buckets[i].1,
                 output: buckets[i].2,
@@ -783,7 +802,10 @@ mod tests {
             tool: TOOL_CLAUDE.to_string(),
         };
         let e = compute_event(&raw, &cfg, &pricing);
-        assert_eq!(e.cache, 1150.0, "1-hour cache writes belong in the cache total");
+        assert_eq!(
+            e.cache, 1150.0,
+            "1-hour cache writes belong in the cache total"
+        );
         assert_eq!(e.input + e.cache + e.output, 1180.0);
     }
 
@@ -825,7 +847,10 @@ mod tests {
         assert_eq!(normalize_model("global.openai.gpt-5.6-sol"), "gpt-5.6-sol");
         assert_eq!(normalize_model("anthropic.claude-opus-5"), "claude-opus-5");
         // dated releases merge into their base model
-        assert_eq!(normalize_model("claude-haiku-4-5-20251001"), "claude-haiku-4-5");
+        assert_eq!(
+            normalize_model("claude-haiku-4-5-20251001"),
+            "claude-haiku-4-5"
+        );
         // but a version dot or quantization tag is part of the model name
         assert_eq!(normalize_model("glm-5.1"), "glm-5.1");
         assert_eq!(normalize_model("qwen3.8-27b-mlx@4bit"), "qwen3.8-27b-mlx");
@@ -842,7 +867,7 @@ mod tests {
 
         assert_eq!(r.metrics.total_tokens, 3.0);
         assert_eq!(r.metrics.requests, 1); // neither older event is a request in the window
-        // delta is measured against the previous 5 h block, not the previous day
+                                           // delta is measured against the previous 5 h block, not the previous day
         assert_eq!(r.metrics.delta_tokens, 50.0);
         // per-model split works for the window too (this is what "count each
         // model" rides on)

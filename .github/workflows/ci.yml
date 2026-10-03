@@ -29,6 +29,19 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Tauri's Linux backend pulls webkit2gtk -> gio-sys -> GLib, which are
+      # pkg-config system libraries. They are absent from a bare ubuntu runner,
+      # so `cargo test --lib` cannot even build there without them (the release
+      # workflow never hit this: it only builds macOS and Windows bundles).
+      - name: Install Tauri Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
       - name: Cache Rust
         uses: swatinem/rust-cache@v2
         with:

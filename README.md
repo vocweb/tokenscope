@@ -4,7 +4,7 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-A **menu-bar / system-tray app for macOS and Windows** that shows your AI coding agents' **daily token usage, estimated cost, and per-model / per-agent / MCP / Skill breakdown** — **Claude Code, Codex CLI, opencode and Oh My Pi** in one place.
+A **menu-bar / system-tray app for macOS and Windows** that shows your AI coding agents' **daily token usage, estimated cost, and per-model / per-agent / MCP / Skill breakdown** — **Claude Code, Codex CLI, opencode, Oh My Pi and pi** in one place.
 
 Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 
@@ -15,7 +15,7 @@ Stack: **Tauri 2 + React + TypeScript** (frontend) / **Rust** (data layer).
 - Shows today's token count next to the menu-bar icon (e.g. `⬡ 14.00M`)
 - Click to open the panel: **5H / Day / Week / Month** toggle — `5H` is the *rolling* last-5-hours window subscription plans meter their session limits in (Day/Week/Month stay calendar-based)
 - Metrics: total tokens (input/output), estimated cost, requests / sessions
-- Four breakdowns: **by agent** (Claude Code / Codex / opencode / Oh My Pi) / **by model** / **by MCP call** / **by Skill call**
+- Four breakdowns: **by agent** (Claude Code / Codex / opencode / Oh My Pi / pi) / **by model** / **by MCP call** / **by Skill call**
 - **Plan limits**: the 5-hour / weekly / monthly windows the *provider* meters (opencode Go/Zen, Claude), with % used and reset countdowns — fetched live, not inferred from logs
 - Cost donut (hover for a single model), year-long activity heatmap
 - **Popover + real window, at the same time** (tray menu → *Open in Window*): left-clicking the menu-bar icon always opens the quick-look popover, while *Open in Window* opens a second, ordinary decorated window with a Dock icon (macOS) / taskbar entry (Windows) that reopens where you left it. Closing that window hides it — the app keeps living in the menu bar — and no restart is needed to open it again
@@ -43,7 +43,7 @@ Sources that aren't installed are simply skipped — no directory, no data, no e
 
 ### Key processing
 - Deduplicated by `message.id` (streaming/retries repeat the same usage); when one message spans multiple lines, its tool calls are merged and the token usage is counted once
-- Per-source token mapping: Claude Code reports the four classes directly; **Codex** counts cached input *inside* `input_tokens` (so uncached input = the difference) and has no cache-write figure; **opencode**'s separate `reasoning` bucket folds into output (same rate); **Oh My Pi** reports the same four classes as Claude Code
+- Per-source token mapping: Claude Code reports the four classes directly; **Codex** counts cached input *inside* `input_tokens` (so uncached input = the difference) and has no cache-write figure; **opencode**'s separate `reasoning` bucket folds into output (same rate); **Oh My Pi** reports the same four classes as Claude Code; **pi** reports `usage{input, output, cacheRead, cacheWrite, reasoning}` per assistant message, with `reasoning` folding into output and `cacheWrite` counting as 5-minute cache creation (same convention as opencode)
 - **Codex** rollouts carry a per-turn `last_token_usage` plus a cumulative `total_token_usage`; the per-turn figure is used, so a session's tokens land on the hour/day they happened. One rollout file = one session
 - **Oh My Pi** writes per-agent logs (`__advisor.*.jsonl`, subagent files) under one session directory; they are grouped into a single session, and every agent's tokens count
 - Tool classification (MCP / Skill breakdowns) reads **Claude Code** logs only — the MCP whitelist comes from Claude's own config, so other agents' tool calls count toward their agent total but not those two lists
@@ -166,7 +166,7 @@ src/                  React frontend
   charts.tsx          chart primitives (bars / donut / sparkline / heatmap / segmented control)
   App.tsx             main panel
 src-tauri/src/
-  store.rs            incremental multi-agent ingest — Claude Code / Codex CLI / opencode (JSON + SQLite) / Oh My Pi (dedup by message id)
+  store.rs            incremental multi-agent ingest — Claude Code / Codex CLI / opencode (JSON + SQLite) / Oh My Pi (dedup by message id) / pi (session JSONL, `~/.pi/agent/sessions`)
   parser.rs           aggregation (Day/Week/Month + heatmap)
   pricing.rs          models.dev / LiteLLM price loading and costing
   config.rs           user MCP / Skill whitelist

@@ -98,7 +98,7 @@ function ModelRow({ m, max, theme, share }: { m: ModelStat; max: number; theme: 
 }
 
 // One source CLI's share of the period (Claude Code / Codex / opencode /
-// Oh My Pi). Same row geometry as ModelRow so the two lists line up.
+// Oh My Pi / pi). Same row geometry as ModelRow so the two lists line up.
 function ToolRow({ s, max, theme, share }: { s: ToolStat; max: number; theme: Theme; share: number }) {
   const pctStr = share % 1 === 0 ? share.toFixed(0) : share.toFixed(1);
   return (
@@ -488,7 +488,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
         {tokenModels.length === 0 && <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint, padding: "4px 0" }}>No usage in this period</div>}
         {tokenModels.map((m, i) => <ModelRow key={i} m={m} max={maxM} theme={t} share={tokenShares[i]} />)}
         <SectionRule t={t} m="10px 0 10px" />
-        {/* by coding agent — Claude Code / Codex / opencode / Oh My Pi */}
+        {/* by coding agent — Claude Code / Codex / opencode / Oh My Pi / pi */}
         {tools.length > 1 && (
           <>
             <div style={{ marginBottom: 4 }}><Label t={t}>By coding agent</Label></div>
@@ -497,7 +497,7 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
           </>
         )}
         {/* plan limits — provider-reported windows, current state (not period-scoped) */}
-        {dash.limits.length > 0 && (
+        {dash.limits.length > 0 ? (
           <>
             <SectionRule t={t} m="10px 0 10px" />
             <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
@@ -509,6 +509,20 @@ function Panel({ dash, dark, themePref, onToggleTheme, openGen, active }: { dash
             {dash.limits.map((l) => (
               <PlanLimitRow key={`${l.provider}:${l.window}:${l.label}`} l={l} theme={t} />
             ))}
+          </>
+        ) : (
+          // No window from any source (no credential anywhere yet, and Oh My
+          // Pi never recorded one): say so instead of hiding the section, or
+          // the next "where did my limits go" report starts from zero again.
+          <>
+            <SectionRule t={t} m="10px 0 10px" />
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 4 }}>
+              <Label t={t}>Plan limits</Label>
+              <span style={{ font: `500 9.5px ${t.mono}`, color: t.faint, whiteSpace: "nowrap" }}>unavailable</span>
+            </div>
+            <div style={{ font: `500 10.5px ${t.mono}`, color: t.faint }}>
+              No provider usage reported yet — open the tray menu → Refresh once a plan credential exists.
+            </div>
           </>
         )}
         {/* cost donut */}

@@ -76,10 +76,7 @@ const PROVIDER_SEGMENTS: &[&str] = &[
 /// ("glm-5.1", "gpt-5.6-sol") is never touched.
 pub fn canonical_id(id: &str) -> String {
     let mut s = id.split('@').next().unwrap_or(id);
-    loop {
-        let Some((head, tail)) = s.split_once('.') else {
-            break;
-        };
+    while let Some((head, tail)) = s.split_once('.') {
         if tail.is_empty() || !PROVIDER_SEGMENTS.contains(&head.to_ascii_lowercase().as_str()) {
             break;
         }
@@ -432,6 +429,11 @@ impl Pricing {
             ("gpt-5.6-sol", mk(4.0, 20.0, 5.0, 0.0, 0.4)),
             ("gpt-5.6-terra", mk(2.0, 12.0, 2.5, 0.0, 0.2)),
             ("gpt-5.5", mk(5.0, 30.0, 0.0, 0.0, 0.5)),
+            // opencode-go routed models the tables don't list (rates as the
+            // provider's own registry publishes them, $/MTok; pi's own
+            // per-message cost is computed from the same numbers).
+            ("deepseek-v4.1-flash", mk(0.15, 0.6, 0.0, 0.0, 0.003)),
+            ("muse-spark-1.3-contributor", mk(0.1, 0.2, 0.0, 0.0, 0.002)),
         ];
         for (id, price) in b {
             self.insert(id, price.clone());
@@ -688,3 +690,4 @@ mod tests {
         assert!(approx(sonnet5.input, 2e-6) && approx(sonnet5.output, 10e-6));
     }
 }
+

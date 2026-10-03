@@ -5,7 +5,7 @@
 use crate::config::UserConfig;
 use crate::model::*;
 use crate::pricing::{canonical_id, Pricing};
-use crate::store::{RawEvent, Store, TOOL_CLAUDE, TOOL_CODEX, TOOL_OMP, TOOL_OPENCODE};
+use crate::store::{RawEvent, Store, TOOL_CLAUDE, TOOL_CODEX, TOOL_OMP, TOOL_OPENCODE, TOOL_PI};
 use chrono::{DateTime, Datelike, Duration, Local, Timelike};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -59,13 +59,14 @@ fn tool_label(tool: &str) -> &str {
         TOOL_CODEX => "Codex",
         TOOL_OPENCODE => "opencode",
         TOOL_OMP => "Oh My Pi",
+        TOOL_PI => "pi",
         other => other,
     }
 }
 
 /// Fixed render order for the by-agent breakdown (biggest installed base first),
 /// so rows don't reshuffle as usage shifts between periods.
-const TOOL_ORDER: [&str; 4] = [TOOL_CLAUDE, TOOL_CODEX, TOOL_OPENCODE, TOOL_OMP];
+const TOOL_ORDER: [&str; 5] = [TOOL_CLAUDE, TOOL_CODEX, TOOL_OPENCODE, TOOL_OMP, TOOL_PI];
 
 // Top-5 models keep the green/slate scheme; everything beyond is uniform gray.
 const PALETTE: &[&str] = &["#1f9d63", "#34c27e", "#6ad0a0", "#a7e3c5", "#4b5a52"];
@@ -225,12 +226,7 @@ fn compute_event(r: &RawEvent, cfg: &UserConfig, pricing: &Pricing) -> Event {
     let cost_opt = pricing
         .cost(&r.model, r.in_tok, r.out_tok, r.cc, r.cc_1h, r.cr)
         .or_else(|| pricing.cost(&model, r.in_tok, r.out_tok, r.cc, r.cc_1h, r.cr));
-    let mcp = r
-        .mcp
-        .iter()
-        .filter(|s| cfg.is_user_mcp(s))
-        .cloned()
-        .collect();
+    let mcp = r.mcp.iter().filter_map(|s| cfg.resolve_mcp(s)).collect();
     let skills = r
         .skills
         .iter()
@@ -375,7 +371,7 @@ impl Agg {
                 count: *c,
             })
             .collect();
-        v.sort_by(|a, b| b.count.cmp(&a.count));
+        v.sort_by_key(|c| std::cmp::Reverse(c.count));
         v
     }
 
@@ -480,7 +476,7 @@ fn report_week(events: &[Event], now: DateTime<Local>) -> PeriodReport {
 
     let mut agg = Agg::default();
     let mut prev = Agg::default();
-    let mut buckets = vec![(0.0f64, 0.0f64, 0.0f64); 7];
+    let mut buckets = [(0.0f64, 0.0f64, 0.0f64); 7];
     let mut req_b = vec![0.0f64; 7];
     let mut cost_b = vec![0.0f64; 7];
 
@@ -583,7 +579,7 @@ fn report_month(events: &[Event], now: DateTime<Local>) -> PeriodReport {
     let series = (0..days_in_month)
         .map(|i| {
             let dn = (i + 1) as u32;
-            let label = if i == 0 || dn % 5 == 0 {
+            let label = if i == 0 || dn.is_multiple_of(5) {
                 dn.to_string()
             } else {
                 String::new()
@@ -789,6 +785,36 @@ mod tests {
         let e = compute_event(&raw, &cfg, &pricing);
         assert_eq!(e.cache, 1150.0, "1-hour cache writes belong in the cache total");
         assert_eq!(e.input + e.cache + e.output, 1180.0);
+    }
+
+    #[test]
+    fn an_oh_my_pi_mcp_call_survives_the_installed_server_filter() {
+        // Oh My Pi flattens the call into one name; it must still resolve to the
+        // server the user installed, or the MCP breakdown reads zero for a user
+        // who only works in Oh My Pi.
+        let cfg = UserConfig {
+            mcp_servers: ["chrome-devtools"].iter().map(|s| s.to_string()).collect(),
+            skills: HashSet::new(),
+        };
+        let pricing = Pricing::shared();
+        let raw = RawEvent {
+            ts_ms: 0,
+            session: "s1".to_string(),
+            model: "claude-opus-5".to_string(),
+            in_tok: 1.0,
+            cc: 0.0,
+            cc_1h: 0.0,
+            cr: 0.0,
+            out_tok: 1.0,
+            n: 1,
+            mcp: vec!["chrome_devtools_navigate_page".to_string()],
+            skills: Vec::new(),
+            id: "m2".to_string(),
+            source: String::new(),
+            tool: TOOL_OMP.to_string(),
+        };
+        let e = compute_event(&raw, &cfg, &pricing);
+        assert_eq!(e.mcp, vec!["chrome-devtools"]);
     }
 
     #[test]

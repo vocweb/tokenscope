@@ -51,7 +51,7 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
 #### 多维度切片
 仪表盘核心四个切片维度：
 
-- **按 agent** 分布（Claude Code / Codex / opencode / Oh My Pi）—— 看 token & 请求量落在哪个工具上
+- **按 agent** 分布（Claude Code / Codex / opencode / Oh My Pi / pi）—— 看 token & 请求量落在哪个工具上
 - **按模型** 分布（Opus / Sonnet / Haiku，以及第三方模型如 GLM、DeepSeek）—— 看 token & 花费在不同模型上的分布
 - **按 MCP 调用** 分布 —— 用户安装的 MCP 各自被调用了多少次
 - **按 Skill 调用** 分布 —— 用户安装的 Skill 各自被调用了多少次
@@ -66,14 +66,14 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
 > **明确策略：仅展示用户自己安装的 MCP 和 Skill，Claude 内置工具（Bash/Read/Edit 等）和 Anthropic 自带 MCP（Claude_Preview 等）一律过滤。**
 
 #### 用户 MCP 调用
-- 数据源：`~/.claude.json` 的 `mcpServers`（含 user 级和 project 级）
+- 数据源：各 agent 自己的 MCP 配置（见 §3.3）
 - 展示：按 server 聚合调用次数排行（不下钻到具体工具）
 - 价值：发现高频 MCP、识别"装了没用"的 MCP
 
 #### 用户 Skill 调用
-- 数据源：`~/.claude/skills/` 目录
+- 数据源：各 agent 的 skill 目录（见 §3.3）
 - 展示：按 skill 名称排行
-- 提取方式：`tool_use.name == "Skill"` 时读 `input.skill` 字段
+- 提取方式：Claude Code 取 `tool_use.name == "Skill"` 的 `input.skill`，以及斜杠命令的 `<command-name>`；Oh My Pi / pi 取读取 skill 本身的 tool call（`arguments.path == "skill://<id>"`）
 
 ---
 
@@ -89,6 +89,7 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
 | opencode（新） | `~/.local/share/opencode/opencode.db` → 表 `message` 的 `data` 列 | SQLite + JSON 文档 |
 | opencode（旧） | `~/.local/share/opencode/storage/message/<sessionID>/<msgID>.json` | 每消息一个 JSON 文件 |
 | Oh My Pi | `~/.omp/agent/sessions/**/*.jsonl`、`~/.omp/profiles/<profile>/agent/sessions/**/*.jsonl` | JSONL，`type=message` 的 assistant 消息带 `usage` |
+| pi | `$PI_SESSIONS_DIR`（默认 `~/.pi/agent/sessions/<cwd>/*.jsonl`） | JSONL，`type=message` 的 assistant 消息带 `usage{input, output, cacheRead, cacheWrite, reasoning}`，session 取自文件名中的 uuid |
 
 - **Claude Code** 关键事件类型：
   - `user` —— 用户消息（含 timestamp / cwd / gitBranch / version）
@@ -96,7 +97,7 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
   - `attachment` —— 附加内容（如 skill_listing）
 - 未安装的 agent：目录不存在即跳过，不报错
 - 同一会话可能分散在多个文件（Oh My Pi 的 `__advisor.*.jsonl`、subagent 日志）→ 归入同一 session
-- 四个 token 口径差异：Codex 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；opencode 的 `reasoning` 计入 output；Oh My Pi 与 Claude Code 一致
+- 五个 token 口径差异：Codex 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；opencode 的 `reasoning` 计入 output；Oh My Pi 与 Claude Code 一致；pi 与 opencode 同口径（`reasoning` 计入 output，`cacheWrite` 按 5 分钟缓存计）
 
 ### 3.2 Assistant 消息核心字段
 ```json
@@ -126,8 +127,10 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
 ```
 
 ### 3.3 配置数据源（用于"用户自定义"过滤）
-- `~/.claude.json` —— 读取 `mcpServers` 和 `projects[*].mcpServers`
-- `~/.claude/skills/` —— 扫描目录得到用户安装的 Skill 名单
+- MCP：`~/.claude.json` 的 `mcpServers` 与 `projects[*].mcpServers`；各 agent 自己的 `mcp.json`（`~/.omp/agent`、`~/.omp/profiles/*/agent`、pi 的 agent 目录）；Codex 的 `~/.codex/config.toml` 中 `[mcp_servers.*]` 表
+- Skill：`~/.claude/skills/`、各 agent 目录的 `skills/`、Oh My Pi 插件 skills（`~/.omp/plugins/*/skills/`）—— 扫描目录得到用户安装的 Skill 名单
+- 跨 agent 取**并集**：同一台机器上任一 agent 安装的 MCP / Skill 都算「用户自己的」——只在 Oh My Pi 里装过的 server，被 Claude Code 调用时同样计入
+- 匹配做归一化：server 名忽略大小写与 `-`/`_` 差异并按最长前缀匹配（Oh My Pi 会把 server 与工具名压平成一个名字）；skill id 允许 `plugin:skill` → `plugin-skill` 形式对上目录名
 
 ### 3.4 数据采集策略
 - 监听上述所有数据源目录的文件变化（fs.watch / FSEvents），写入后 ~1s 内刷新；30s 轮询兜底
@@ -155,16 +158,21 @@ TokenScope —— macOS 菜单栏 Claude CLI 用量仪表盘
 
 ### 4.1 工具调用分类逻辑
 ```
-tool_use.name 判定：
+tool_use.name 判定（各 agent 的工具调用都会被分类）：
   1. 在内置工具黑名单中 → 过滤，不展示
-  2. 以 "mcp__" 开头：
-     - server 在用户 mcpServers 配置中 → 展示为「用户 MCP」
-     - 否则 → 过滤（Anthropic 内置 MCP）
-  3. == "Skill"：
-     - input.skill 在 ~/.claude/skills/ 中 → 展示为「用户 Skill」
+  2. MCP 调用（命名约定按 agent 不同）：
+     - Claude Code / Codex：mcp__<server>__<tool>
+     - Oh My Pi / pi：xd_mcp__<server>_<tool>（server 与 tool 被压平，靠归一化最长前缀对上配置）
+     - server 在用户 MCP 配置中（§3.3，跨 agent 并集）→ 展示为「用户 MCP」
+     - 否则 → 过滤（各 agent 自带 / 托管的 MCP，如 Claude Code 的 claude-in-chrome）
+  3. Skill 调用：
+     - Claude Code：tool_use.name == "Skill" 的 input.skill，或斜杠命令 <command-name>/<skill>
+     - Oh My Pi / pi：读取 skill 本身的 tool call（arguments.path == "skill://<id>"；读 skill 内的引用文件不计）
+     - id 在用户 skill 名单中（§3.3，允许 plugin:skill → plugin-skill）→ 展示为「用户 Skill」
      - 否则 → 过滤（bundled skill）
   4. 其他 → 过滤
 ```
+> 每次改动提取逻辑都要提升 `STORE_VERSION`（`src-tauri/src/store.rs`），否则增量 manifest 会跳过已读字节，旧缓存继续按老规则计数。
 
 ### 4.2 内置工具黑名单（硬编码）
 ```

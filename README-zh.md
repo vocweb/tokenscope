@@ -4,7 +4,7 @@
 
 <a href="https://www.producthunt.com/products/tokenscope-2?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-tokenscope-2" target="_blank" rel="noopener noreferrer"><img alt="Tokenscope - MacOS menu-bar dashboard for Claude CLI token usage | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1165012&amp;theme=light&amp;t=1780816780292"></a>
 
-**macOS 菜单栏 / Windows 系统托盘工具**，展示你的各个 AI coding agent 的 **每日 Token 用量、估算花费、按 agent / 模型 / MCP / Skill 的调用统计** —— **Claude Code、Codex CLI、opencode、Oh My Pi** 汇总在一处。
+**macOS 菜单栏 / Windows 系统托盘工具**，展示你的各个 AI coding agent 的 **每日 Token 用量、估算花费、按 agent / 模型 / MCP / Skill 的调用统计** —— **Claude Code、Codex CLI、opencode、Oh My Pi、pi** 汇总在一处。
 
 技术栈：**Tauri 2 + React + TypeScript**（前端）/ **Rust**（数据层）。
 
@@ -15,7 +15,7 @@
 - 菜单栏图标旁显示当日 Token 数（如 `⬡ 14.00M`）
 - 点击打开面板：**5H / Day / Week / Month** 切换 —— `5H` 是**滚动**的最近 5 小时窗口（订阅计划的 session 额度就按它计），Day/Week/Month 仍是自然日/周/月
 - 指标：总 Token（input/output）、估算花费、Requests / Sessions
-- 四个切片：**按 agent**（Claude Code / Codex / opencode / Oh My Pi）/ **按模型** / **按 MCP 调用** / **按 Skill 调用**
+- 四个切片：**按 agent**（Claude Code / Codex / opencode / Oh My Pi / pi）/ **按模型** / **按 MCP 调用** / **按 Skill 调用**
 - **计划额度（Plan limits）**：服务商侧的 5 小时 / 每周 / 每月窗口（opencode Go/Zen、Claude），显示已用百分比与重置倒计时 —— 直接调用接口获取，不是从日志推算
 - 成本甜甜圈（hover 看单模型）、年度活跃热力图
 - **浮窗与普通窗口并存**（托盘菜单 → *Open in Window*）：左键点击菜单栏图标始终打开快速查看浮窗；*Open in Window* 另外打开一个普通应用窗口（带标题栏、可缩放，macOS 出现在 Dock / Windows 出现在任务栏，位置和大小会被记住）。关闭该窗口只是隐藏（应用继续留在菜单栏），再次打开无需重启
@@ -43,7 +43,7 @@
 
 ### 关键处理
 - 按 `message.id` 去重（流式/重试会重复 usage）；同一消息跨多行时合并其工具调用，token 只计一次
-- 各源 token 口径：Claude Code 直接给出四类；**Codex** 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；**opencode** 单独的 `reasoning` 计入 output；**Oh My Pi** 与 Claude Code 一致
+- 各源 token 口径：Claude Code 直接给出四类；**Codex** 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；**opencode** 单独的 `reasoning` 计入 output；**Oh My Pi** 与 Claude Code 一致；**pi** 每条 assistant 消息带 `usage{input, output, cacheRead, cacheWrite, reasoning}`，`reasoning` 计入 output、`cacheWrite` 按 5 分钟缓存计（与 opencode 同口径）
 - **Codex** rollout 同时携带本轮 `last_token_usage` 与会话累计 `total_token_usage`，取本轮值，token 落在真实发生的小时/日期；一个 rollout 文件 = 一个会话
 - **Oh My Pi** 同一会话会拆成多个 agent 日志（`__advisor.*.jsonl`、subagent），归入同一 session，且所有 agent 的 token 都计入
 - MCP / Skill 两个榜单只读 **Claude Code** 日志（白名单来自 Claude 自己的配置）；其他 agent 的工具调用计入其 agent 总量，不进这两个榜单
@@ -163,7 +163,7 @@ src/                  React 前端
   charts.tsx          图表原语（柱状/甜甜圈/sparkline/热力图/分段控件）
   App.tsx             主面板
 src-tauri/src/
-  store.rs            多 agent 增量摄取 —— Claude Code / Codex CLI / opencode（JSON + SQLite）/ Oh My Pi（按 message id 去重）
+  store.rs            多 agent 增量摄取 —— Claude Code / Codex CLI / opencode（JSON + SQLite）/ Oh My Pi（按 message id 去重）/ pi（session JSONL，`~/.pi/agent/sessions`）
   parser.rs           聚合（Day/Week/Month + 热力图）
   pricing.rs          models.dev / LiteLLM 价格加载与计价
   config.rs           用户 MCP / Skill 白名单

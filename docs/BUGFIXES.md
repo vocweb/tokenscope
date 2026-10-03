@@ -48,6 +48,31 @@ fix. Newest first. Useful as a reference for similar issues.
 - **Fix**: Changed `pct_delta` to `((cur-prev)/prev*10000).round()/100`, which
   returns a real percentage with 2 decimals (e.g. `20.47`).
 
+### 17. MCP / Skill calls were counted for Claude Code only
+
+- **Symptom**: A user whose week is 99.8% Oh My Pi (21k requests, 20 sessions)
+  saw **MCP calls 0** and **Skill calls 1** — the two cards looked broken, and
+  neither matched reality (36 real skill invocations that week).
+- **Cause**: Only `parse_assistant` extracted MCP / Skill calls. `parse_omp_line`
+  and `parse_pi_message` hardcoded `mcp: Vec::new(), skills: Vec::new()`, and
+  codex never looked at `function_call` at all, so every non-Claude agent's tool
+  calls were dropped. The whitelists were Claude-only too (`~/.claude.json`
+  `mcpServers` + `~/.claude/skills`), and Oh My Pi flattens an MCP call into one
+  name (`xd_mcp__<server>_<tool>`) that can never equal a configured server key.
+- **Fix**: Extract tool calls from every ingested agent — Oh My Pi / pi from
+  their `toolCall` content blocks (MCP via the shared `mcp_candidate`, a skill
+  when the call reads `skill://<id>` itself, not a file inside it), codex from
+  `response_item`/`function_call` names buffered onto the usage row that follows.
+  `config.rs` now unions the installed MCP servers (each agent's own
+  `mcp.json` / Codex's `[mcp_servers.*]`) and skill folders across agents, and
+  resolves a candidate by normalized longest prefix so `chrome_devtools_navigate_page`
+  matches the `chrome-devtools` the user configured. Bumped `STORE_VERSION` to 9.
+- **Note**: forced rescans are therefore unavoidable for extraction changes, and
+  this one also replaced a cache that held far more Oh My Pi requests than the
+  logs do (36,638 cached vs 21,182 recomputed from the JSONL). The rescan output
+  matches the logs, so the corrected numbers are the right ones; the inflation
+  source itself is still open (cf. the re-read idempotency class in `REVIEW.md`).
+
 ---
 
 ## Release & distribution (CI)

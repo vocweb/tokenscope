@@ -31,6 +31,7 @@ pub const TOOL_CLAUDE: &str = "claude";
 pub const TOOL_CODEX: &str = "codex";
 pub const TOOL_OPENCODE: &str = "opencode";
 pub const TOOL_OMP: &str = "omp";
+pub const TOOL_PI: &str = "pi";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RawEvent {
@@ -49,8 +50,8 @@ pub struct RawEvent {
     /// compacted day row carries however many it summed.
     #[serde(default = "one")]
     pub n: u64,
-    pub mcp: Vec<String>,    // all mcp__<server> names called (unfiltered)
-    pub skills: Vec<String>, // all Skill input.skill ids called (unfiltered)
+    pub mcp: Vec<String>,    // server candidates of this row's tool calls (unfiltered)
+    pub skills: Vec<String>, // skill ids called in this row (unfiltered)
     pub id: String,          // message id (dedup)
     // Source log file (manifest key). Lets a truncated/rewritten file purge its
     // own stale events before being re-read, so re-ingestion stays idempotent.
@@ -105,6 +106,11 @@ struct FileState {
     model: String,
     seq: u64,       // emitted-event counter, used to build stable ids
     tot: [u64; 4],  // last cumulative (input, cached, output, reasoning)
+    /// Codex logs a tool call (`response_item`/`function_call`) on its own line,
+    /// before the `token_count` event that carries the usage, so names seen
+    /// since the last emitted event are held here and attached to the next one.
+    #[serde(default)]
+    pending: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -147,7 +153,9 @@ pub struct Store {
 //   v8: codex turns that report only `total_tokens` (breakdown zeroed) are
 //       counted instead of recorded as zero-token requests; a v7 cache holds
 //       those as 0, so it must be rebuilt for that history to be right.
-const STORE_VERSION: u32 = 8;
+//   v9: MCP / Skill calls are extracted from every agent's logs, not just
+//       Claude Code's (Oh My Pi and pi tool calls were dropped outright).
+const STORE_VERSION: u32 = 9;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -240,6 +248,11 @@ pub fn watch_roots() -> Vec<PathBuf> {
     for omp in omp_session_roots() {
         if omp.is_dir() {
             roots.push(omp);
+        }
+    }
+    if let Some(pi) = pi_sessions_dir() {
+        if pi.is_dir() {
+            roots.push(pi);
         }
     }
     roots
@@ -513,6 +526,7 @@ impl Store {
         dirty |= self.ingest_omp();
         dirty |= self.ingest_opencode_json();
         dirty |= self.ingest_opencode_db();
+        dirty |= self.ingest_pi();
         dirty
     }
 
@@ -658,6 +672,33 @@ impl Store {
                     parse_omp_line(v, &session)
                 });
             }
+        }
+        dirty
+    }
+
+    // ── pi ──────────────────────────────────────────────────────────
+    /// pi session root: $PI_SESSIONS_DIR, default ~/.pi/agent/sessions. One
+    /// `<iso>_<uuid>.jsonl` per run under a per-cwd directory; the uuid is the
+    /// session, so runs in different projects never merge.
+    fn ingest_pi(&mut self) -> bool {
+        let Some(root) = pi_sessions_dir() else {
+            return false;
+        };
+        if !root.is_dir() {
+            return false;
+        }
+        let mut dirty = false;
+        let paths: Vec<PathBuf> = WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        for path in paths {
+            let session = pi_session_from_path(&path);
+            dirty |= self.scan_jsonl(&path, TOOL_PI, &mut |v, _st| {
+                parse_pi_message(v, &session)
+            });
         }
         dirty
     }
@@ -808,6 +849,58 @@ impl Store {
     }
 }
 
+// ── Tool-call classification (shared by every agent's parser) ───────
+/// The server *candidate* of a tool name, or None when the name is not an MCP
+/// call. Each agent spells one differently:
+///   Claude Code, Codex: `mcp__<server>__<tool>` → `<server>`
+///   Oh My Pi:           `xd_mcp__<server>_<tool>` → `<server>_<tool>`
+/// (pi, and opencode's `pencil_batch_design`, use the flat form too.)
+/// The flat form is kept whole because which half is the server is only knowable
+/// once the installed-server list is available; `UserConfig::resolve_mcp` picks
+/// the longest installed prefix at that point.
+fn mcp_candidate(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        return Some(rest.split("__").next().unwrap_or("").to_string());
+    }
+    name.strip_prefix("xd_mcp__").map(|rest| rest.to_string())
+}
+
+/// The skill id of a tool call, or None. Oh My Pi and pi invoke a skill by
+/// reading it (`skill://ak:debug`); reading a path *inside* a skill
+/// (`skill://ak:plan/references/…`) is that skill's own reference file, not a
+/// new invocation, so it is not counted.
+fn skill_from_tool_call(name: &str, args: Option<&serde_json::Value>) -> Option<String> {
+    if name != "read" {
+        return None;
+    }
+    let rest = args?.get("path")?.as_str()?.strip_prefix("skill://")?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// MCP servers and skills of one Oh My Pi / pi assistant message. Both agents
+/// log a tool call as a `toolCall` content block carrying the name and a typed
+/// `arguments` object, so one walk serves both.
+fn tool_calls_from_content(content: Option<&serde_json::Value>) -> (Vec<String>, Vec<String>) {
+    let mut mcp = Vec::new();
+    let mut skills = Vec::new();
+    for block in content.and_then(|c| c.as_array()).into_iter().flatten() {
+        if block.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
+            continue;
+        }
+        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if let Some(server) = mcp_candidate(name) {
+            mcp.push(server);
+        }
+        if let Some(skill) = skill_from_tool_call(name, block.get("arguments")) {
+            skills.push(skill);
+        }
+    }
+    (mcp, skills)
+}
+
 // ── Claude Code line parser ────────────────────────────────────────
 /// Parse one Claude Code JSONL line into a RawEvent (assistant messages only).
 fn parse_claude_line(v: &serde_json::Value) -> Option<RawEvent> {
@@ -913,8 +1006,8 @@ fn parse_assistant(v: &serde_json::Value) -> Option<RawEvent> {
                 continue;
             }
             let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
-            if let Some(rest) = name.strip_prefix("mcp__") {
-                mcp.push(rest.split("__").next().unwrap_or("").to_string());
+            if let Some(server) = mcp_candidate(name) {
+                mcp.push(server);
             } else if name == "Skill" {
                 if let Some(sk) = block
                     .get("input")
@@ -963,6 +1056,13 @@ fn parse_codex_line(
     if kind == "turn_context" {
         if let Some(m) = v.pointer("/payload/model").and_then(|m| m.as_str()) {
             st.model = m.to_string();
+        }
+        return None;
+    }
+    // A tool call arrives as its own line, ahead of the usage it belongs to.
+    if kind == "response_item" && v.pointer("/payload/type")?.as_str()? == "function_call" {
+        if let Some(name) = v.pointer("/payload/name").and_then(|n| n.as_str()) {
+            st.pending.push(name.to_string());
         }
         return None;
     }
@@ -1028,8 +1128,8 @@ fn parse_codex_line(
         cr: cached as f64,
         out_tok: output as f64,
         n: 1,
-        mcp: Vec::new(), // MCP/Skill breakdown is Claude Code-only (needs its config)
-        skills: Vec::new(),
+        mcp: st.pending.drain(..).filter_map(|n| mcp_candidate(&n)).collect(),
+        skills: Vec::new(), // codex logs no skill invocation, only tool calls
         // Ids are scoped to the *session*, not the file: the same conversation
         // can be mirrored into several profile dirs, and it must still count once.
         id: format!("dx:{}:{}", session, st.seq),
@@ -1076,6 +1176,7 @@ fn parse_omp_line(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
         .and_then(|i| i.as_str())
         .map(|s| s.to_string())
         .unwrap_or_default();
+    let (mcp, skills) = tool_calls_from_content(m.get("content"));
     Some(RawEvent {
         ts_ms,
         session: session.to_string(),
@@ -1090,8 +1191,8 @@ fn parse_omp_line(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
         cr: num(&["cacheRead", "cacheReadTokens"]),
         out_tok: num(&["output", "outputTokens"]),
         n: 1,
-        mcp: Vec::new(),
-        skills: Vec::new(),
+        mcp,
+        skills,
         id: if id.is_empty() {
             String::new()
         } else {
@@ -1105,6 +1206,82 @@ fn parse_omp_line(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
 }
 
 // ── opencode message parser (legacy JSON store + sqlite `data`) ────
+/// pi session root: $PI_SESSIONS_DIR, default ~/.pi/agent/sessions.
+fn pi_sessions_dir() -> Option<PathBuf> {
+    match std::env::var_os("PI_SESSIONS_DIR") {
+        Some(v) => Some(PathBuf::from(v)),
+        None => Some(home()?.join(".pi").join("agent").join("sessions")),
+    }
+}
+
+/// The run uuid from a `<iso>_<uuid>.jsonl` stem; the whole stem when the
+/// name has no such shape (still stable per file, so still a valid key).
+fn pi_session_from_path(path: &Path) -> String {
+    let stem = stem(path);
+    match stem.rfind('_') {
+        Some(i) => stem[i + 1..].to_string(),
+        None => stem,
+    }
+}
+
+// ── pi session parser ───────────────────────────────────────────────
+/// pi logs one JSONL session per run: `{type: session|model_change|message|
+/// compaction|...}`. Only assistant messages carry usage:
+/// `{type: message, timestamp: <rfc3339>, message: {role: assistant, model,
+///   usage: {input, output, cacheRead, cacheWrite, reasoning, totalTokens}}}`.
+/// The inner message timestamp (the API response time) wins, like the OMP
+/// parser; the file-write timestamp is the fallback. `totalTokens` excludes
+/// `reasoning`, which has no bucket here (and shares the output rate), so it
+/// is folded into output rather than dropped — the same convention as the
+/// opencode parser. `cacheWrite` carries no 5m/1h lifetime the way Anthropic's
+/// split does, so it counts as `cc`, again like opencode's.
+fn parse_pi_message(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
+    if v.get("type")?.as_str()? != "message" {
+        return None;
+    }
+    let m = v.get("message")?;
+    if m.get("role")?.as_str()? != "assistant" {
+        return None;
+    }
+    let u = m.get("usage")?;
+    let ts_ms = m
+        .get("timestamp")
+        .and_then(|t| t.as_i64())
+        .or_else(|| {
+            v.get("timestamp")
+                .and_then(|t| t.as_str())
+                .and_then(now_ms_from_rfc3339)
+        })?;
+    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or_default();
+    if id.is_empty() {
+        return None;
+    }
+    let num = |x: Option<&serde_json::Value>| x.and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let (mcp, skills) = tool_calls_from_content(m.get("content"));
+    Some(RawEvent {
+        ts_ms,
+        session: session.to_string(),
+        model: m
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        in_tok: num(u.get("input")),
+        cc: num(u.get("cacheWrite")),
+        cc_1h: 0.0,
+        cr: num(u.get("cacheRead")),
+        out_tok: num(u.get("output")) + num(u.get("reasoning")),
+        n: 1,
+        mcp,
+        skills,
+        // pi ids are bare uuids; prefix so they can never collide with
+        // another agent's id in the global event index
+        id: format!("pi:{id}"),
+        source: String::new(),
+        tool: String::new(), // filled in by the caller
+    })
+}
+
 /// Both opencode stores hold the same message document:
 /// `{ id, sessionID, role, time: { created }, modelID, providerID,
 ///    tokens: { input, output, reasoning, cache: { read, write } } }`.
@@ -1145,6 +1322,8 @@ fn parse_opencode_message(v: &serde_json::Value, _st: &mut FileState) -> Option<
         cr: num(tokens.pointer("/cache/read")),
         out_tok: num(tokens.get("output")) + num(tokens.get("reasoning")),
         n: 1,
+        // opencode puts tool calls in `storage/part/<message>/<part>.json`, not
+        // in the message document, so MCP / skill calls are not counted for it.
         mcp: Vec::new(),
         skills: Vec::new(),
         id: if id.is_empty() {
@@ -1166,9 +1345,120 @@ mod tests {
     }
 
     #[test]
+    fn mcp_candidate_reads_each_agents_tool_naming() {
+        // Claude Code / Codex spell out the server
+        assert_eq!(
+            mcp_candidate("mcp__unityMCP__get_gameobject").as_deref(),
+            Some("unityMCP")
+        );
+        // Oh My Pi flattens it, keeping the tool name for the whitelist to
+        // resolve against the installed servers
+        assert_eq!(
+            mcp_candidate("xd_mcp__chrome_devtools_navigate_page").as_deref(),
+            Some("chrome_devtools_navigate_page")
+        );
+        // built-ins and non-mcp tool calls carry no server
+        assert_eq!(mcp_candidate("Bash"), None);
+        assert_eq!(mcp_candidate("exec_command"), None);
+        assert_eq!(mcp_candidate("Skill"), None);
+    }
+
+    #[test]
+    fn skill_invocations_are_reads_of_the_skill_itself() {
+        let args = |p: &str| serde_json::json!({ "path": p });
+        assert_eq!(
+            skill_from_tool_call("read", Some(&args("skill://ak:debug"))).as_deref(),
+            Some("ak:debug")
+        );
+        // a file inside a skill is that skill's own reference material
+        assert_eq!(
+            skill_from_tool_call("read", Some(&args("skill://ak:plan/references/x.md"))),
+            None
+        );
+        assert_eq!(skill_from_tool_call("bash", Some(&args("skill://ak:debug"))), None);
+        assert_eq!(skill_from_tool_call("read", Some(&args("src/main.rs"))), None);
+    }
+
+    #[test]
+    fn omp_tool_calls_yield_mcp_servers_and_skill_calls() {
+        let v = line(
+            r#"{"type":"message","message":{"role":"assistant","model":"claude-opus-5",
+                "timestamp":1790000000000,
+                "usage":{"input":5,"output":7,"cacheRead":0,"cacheWrite":0},
+                "content":[
+                  {"type":"thinking","thinking":"…"},
+                  {"type":"toolCall","name":"xd_mcp__unitymcp_manage_asset","arguments":{"i":"x"}},
+                  {"type":"toolCall","name":"read","arguments":{"path":"skill://ak:debug"}},
+                  {"type":"toolCall","name":"read","arguments":{"path":"skill://ak:plan/references/roles.md"}},
+                  {"type":"toolCall","name":"bash","arguments":{"command":"ls"}}]}}"#,
+        );
+        let ev = parse_omp_line(&v, "s1").unwrap();
+        assert_eq!(ev.mcp, vec!["unitymcp_manage_asset"]);
+        assert_eq!(ev.skills, vec!["ak:debug"]);
+    }
+
+    #[test]
+    fn pi_tool_calls_are_classified_like_omp() {
+        let v = line(
+            r#"{"type":"message","id":"abc","message":{"role":"assistant","model":"m",
+                "timestamp":1790000000000,
+                "usage":{"input":5,"output":7},
+                "content":[
+                  {"type":"toolCall","name":"mcp__pencil__batch_design","arguments":{}},
+                  {"type":"toolCall","name":"read","arguments":{"path":"skill://ak:cook"}}]}}"#,
+        );
+        let ev = parse_pi_message(&v, "s2").unwrap();
+        assert_eq!(ev.mcp, vec!["pencil"]);
+        assert_eq!(ev.skills, vec!["ak:cook"]);
+    }
+
+    #[test]
+    fn codex_tool_calls_land_on_the_usage_row_that_follows() {
+        let mut st = FileState {
+            model: "gpt-5.5".into(),
+            ..Default::default()
+        };
+        // codex logs the call first, then the token_count it belongs to
+        assert!(parse_codex_line(
+            &line(
+                r#"{"type":"response_item","payload":{"type":"function_call",
+                    "name":"mcp__unityMCP__get_gameobject","arguments":"{}"}}"#,
+            ),
+            &mut st,
+            "s"
+        )
+        .is_none());
+        let ev = parse_codex_line(
+            &line(
+                r#"{"timestamp":"2026-09-03T15:29:47.868Z","type":"event_msg","payload":{"type":"token_count",
+                    "info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,
+                    "output_tokens":2,"reasoning_output_tokens":0}}}}"#,
+            ),
+            &mut st,
+            "s",
+        )
+        .unwrap();
+        assert_eq!(ev.mcp, vec!["unityMCP"]);
+        // the buffer is drained, so the next row does not repeat the call
+        let next = parse_codex_line(
+            &line(
+                r#"{"timestamp":"2026-09-03T15:29:48.868Z","type":"event_msg","payload":{"type":"token_count",
+                    "info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,
+                    "output_tokens":2,"reasoning_output_tokens":0}}}}"#,
+            ),
+            &mut st,
+            "s",
+        )
+        .unwrap();
+        assert!(next.mcp.is_empty());
+    }
+
+    #[test]
     fn codex_splits_cached_input_out_of_input() {
-        let mut st = FileState::default();
-        st.model = "gpt-5.5".into();
+        let mut st = FileState {
+            model: "gpt-5.5".into(),
+            ..Default::default()
+        };
         // input_tokens includes the cached portion; the uncached share is the
         // difference, and cache writes are never reported by codex.
         let ev = parse_codex_line(
@@ -1193,8 +1483,10 @@ mod tests {
     fn codex_counts_a_total_only_turn_instead_of_recording_zero() {
         // Older rollout logs zero the breakdown and report the turn as
         // `total_tokens` alone; those sessions still did real work.
-        let mut st = FileState::default();
-        st.model = "gpt-5.5".into();
+        let mut st = FileState {
+            model: "gpt-5.5".into(),
+            ..Default::default()
+        };
         let ev = parse_codex_line(
             &line(
                 r#"{"timestamp":"2026-05-03T14:59:52.501Z","type":"event_msg","payload":{"type":"token_count",
@@ -1311,6 +1603,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!((ev.cc, ev.cc_1h), (0.0, 74546.0));
+    }
+
+    #[test]
+    fn pi_counts_a_full_assistant_turn() {
+        let v = line(r#"{"type":"message","id":"848c5ae5","parentId":"239c9874","timestamp":"2026-09-24T00:40:55.857Z","message":{"role":"assistant","provider":"opencode-go","model":"deepseek-v4.1-flash","api":"openai-completions","timestamp":1790260855000,"usage":{"input":1755,"output":267,"cacheRead":65024,"cacheWrite":0,"reasoning":16,"totalTokens":67046},"content":[]}}"#);
+        let ev = parse_pi_message(&v, "01a0cf0b").expect("assistant turn with usage");
+        assert_eq!(ev.ts_ms, 1790260855000); // inner message ts wins
+        assert_eq!(ev.model, "deepseek-v4.1-flash");
+        assert_eq!(ev.session, "01a0cf0b");
+        assert_eq!(ev.in_tok, 1755.0);
+        assert_eq!(ev.cc, 0.0);
+        assert_eq!(ev.cr, 65024.0);
+        assert_eq!(ev.out_tok, 283.0); // 267 + reasoning 16
+        assert_eq!(ev.id, "pi:848c5ae5");
+    }
+
+    #[test]
+    fn pi_skips_non_usage_lines() {
+        for s in [
+            r#"{"type":"session","id":"01a0cf0b","timestamp":"2026-09-23T16:13:56.081Z","cwd":"/x"}"#,
+            r#"{"type":"model_change","timestamp":"2026-09-23T16:13:58.792Z","provider":"opencode-go","modelId":"deepseek-v4.1-flash"}"#,
+            r#"{"type":"compaction","timestamp":"2026-09-22T17:10:47.959Z","summary":"..."}"#,
+            r#"{"type":"message","id":"u1","timestamp":"2026-09-24T00:40:00.000Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"message","id":"a1","timestamp":"2026-09-24T00:40:01.000Z","message":{"role":"assistant","model":"deepseek-v4.1-flash","content":[]}}"#,
+        ] {
+            assert!(parse_pi_message(&line(s), "s").is_none());
+        }
+    }
+
+    #[test]
+    fn pi_session_comes_from_the_filename_uuid() {
+        assert_eq!(
+            pi_session_from_path(Path::new(
+                "/x/2026-09-23T16-13-56-081Z_01a0cf0b-8df1.jsonl"
+            )),
+            "01a0cf0b-8df1"
+        );
     }
 
     #[test]

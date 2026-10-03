@@ -444,6 +444,12 @@ fn position_popover_windows(app: &tauri::AppHandle) {
 
 /// True if our (Accessory) app is currently the frontmost application.
 #[cfg(target_os = "macos")]
+// The macOS interop below (and in the other `tauri_nspanel` users further down)
+// goes through `cocoa`/`objc` 0.2, which both crates now mark deprecated in
+// favour of `objc2`. `tauri-nspanel` re-exports them and allows the deprecation
+// crate-side itself; moving to objc2 means its 2.1 release, whose panel API
+// (PanelBuilder / panel events) is a rewrite of the setup below, not a drop-in.
+#[allow(deprecated)]
 fn app_is_frontmost() -> bool {
     use tauri_nspanel::cocoa::base::id;
     use tauri_nspanel::objc::{class, msg_send, sel, sel_impl};
@@ -480,6 +486,7 @@ fn hide_panel_on_context_switch(app: &tauri::AppHandle) {
 /// activation (mirrors tauri-nspanel's menu-bar example). The observers live for
 /// the whole app lifetime, so the returned tokens are intentionally dropped.
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // cocoa/objc 0.2 re-exported by tauri-nspanel — see app_is_frontmost
 fn register_panel_autohide(app: &tauri::AppHandle) {
     use std::ffi::CString;
     use tauri_nspanel::block::ConcreteBlock;
@@ -517,6 +524,7 @@ fn register_panel_autohide(app: &tauri::AppHandle) {
 /// (and thus the webview's `prefers-color-scheme`) can lag the real system value.
 /// The user default reflects the system setting directly, regardless of focus.
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // ditto
 fn system_is_dark() -> bool {
     use std::ffi::CStr;
     use tauri_nspanel::cocoa::base::{id, nil};
@@ -525,7 +533,7 @@ fn system_is_dark() -> bool {
         let defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
         let key: id = msg_send![
             class!(NSString),
-            stringWithUTF8String: b"AppleInterfaceStyle\0".as_ptr() as *const std::os::raw::c_char
+            stringWithUTF8String: c"AppleInterfaceStyle".as_ptr()
         ];
         let val: id = msg_send![defaults, stringForKey: key];
         if val == nil {
@@ -548,6 +556,7 @@ fn system_is_dark() -> bool {
 /// lives for the whole app lifetime, so the returned token is intentionally
 /// dropped (same as register_panel_autohide).
 #[cfg(target_os = "macos")]
+#[allow(deprecated)] // ditto
 fn watch_system_theme(app: &tauri::AppHandle) {
     use std::ffi::CString;
     use tauri_nspanel::block::ConcreteBlock;
@@ -671,6 +680,36 @@ fn refresh_pricing(app: tauri::AppHandle) {
     refresh_pricing_bg(&app);
 }
 
+/// Off-thread, forced plan-limits refresh (provider usage endpoints + Oh My Pi
+/// snapshots) bypassing the 15-minute gate, folded into the tray's "Refresh"
+/// item next to pricing. This is the manual escape hatch for the moment right
+/// after a window resets: the cached row still shows the dead window's fill
+/// level (e.g. "100% exhausted") and the next background tick is minutes
+/// away. Once the new snapshot lands, refresh() pushes dashboard-updated so an
+/// open panel re-renders live. Same 30s coalescing as pricing so rapid clicks
+/// can't stack concurrent fetches.
+fn refresh_limits_bg(app: &tauri::AppHandle) {
+    // Own cooldown slot: sharing LAST_FORCE_MS with pricing would let the
+    // pricing call above claim the window and silently skip the limits fetch.
+    static LAST_LIMITS_FORCE_MS: AtomicI64 = AtomicI64::new(0);
+    let now = now_ms();
+    loop {
+        let prev = LAST_LIMITS_FORCE_MS.load(Ordering::Relaxed);
+        if now - prev < FORCE_COOLDOWN_MS {
+            return;
+        }
+        match LAST_LIMITS_FORCE_MS.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(_) => continue,
+        }
+    }
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        limits::reload_shared(true);
+        refresh(&handle);
+    });
+}
+
 /// Save a full-panel screenshot (a `data:image/png;base64,...` URL captured in
 /// the webview) to the user's Desktop as `Tokenscope <date> at <time>.png`.
 /// DOM rasterization sidesteps macOS Screen Recording permission entirely.
@@ -734,6 +773,14 @@ fn fmt_tokens_m(m: f64) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Leave a trace in the system log if a background thread panics: release
+    // builds abort on panic, which otherwise kills the menu-bar process with
+    // no explanation (no crash reporter entry for an abort-on-panic helper
+    // thread in some configurations). Future "the numbers froze" reports
+    // can then be correlated with (or cleared by) a panic line in Console.app.
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[tokenscope] PANIC: {info}");
+    }));
     // Tracks when the popover was last hidden, so a click on the tray icon
     // while it's open (which first blurs/hides it) doesn't immediately reopen.
     let last_hidden = Arc::new(AtomicI64::new(0));
@@ -811,6 +858,8 @@ pub fn run() {
             // apps) like a popover. The detached window is a separate, ordinary
             // window created on demand (see ensure_detached_window).
             #[cfg(target_os = "macos")]
+            // see app_is_frontmost: tauri-nspanel still ships the objc/cocoa 0.2 API
+            #[allow(deprecated)]
             if let Some(window) = app.get_webview_window("main") {
                 use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
                 // NSWindowStyleMaskNonActivatingPanel — receive events without
@@ -1013,6 +1062,7 @@ pub fn run() {
                     "refresh" => {
                         refresh(app);
                         refresh_pricing_bg(app);
+                        refresh_limits_bg(app);
                     }
                     "autostart" => {
                         // Flip the OS registration, re-read the real state, mirror

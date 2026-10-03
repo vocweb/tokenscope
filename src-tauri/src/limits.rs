@@ -37,7 +37,7 @@ use std::fs;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, LazyLock, RwLock};
 use std::time::Duration;
 
 use crate::store::opencode_data_dir;
@@ -71,6 +71,43 @@ pub struct UsageLimit {
 struct Cached {
     fetched_at: i64,
     items: Vec<UsageLimit>,
+    /// Whether the last attempt's live fetch yielded rows from every provider
+    /// it tried. When false the snapshot is last-known data only, so the next
+    /// `reload_shared` must retry immediately instead of honouring the FRESH
+    /// gate — otherwise a failed attempt (e.g. all OAuth copies expired while
+    /// the machine was down) would look "fresh" and the stale rows would
+    /// freeze in place, surviving even an app restart.
+    #[serde(default = "default_live_ok")]
+    live_ok: bool,
+}
+
+fn default_live_ok() -> bool {
+    true // caches written before this flag existed came from a working fetch
+}
+
+/// Pure decision for the FRESH gate, extracted for tests: skip the fetch only
+/// when the last attempt succeeded recently AND no window has rolled since.
+/// A failed attempt never counts as fresh, so recovery starts on the next
+/// tick/restart instead of stalling; a rolled window (0 < resets_at <= now)
+/// is definitionally obsolete — the provider started a new window and we
+/// never heard its fill level — so it also forces a refetch. (`resets_at == 0`
+/// means the provider reported no reset time and is ignored here.)
+fn should_skip(cached: Option<&Cached>, force: bool, now_ms: i64) -> bool {
+    if force {
+        return false;
+    }
+    match cached {
+        Some(c) => {
+            if !c.live_ok {
+                return false;
+            }
+            if c.items.iter().any(|i| i.resets_at_ms > 0 && i.resets_at_ms <= now_ms) {
+                return false;
+            }
+            (0..FRESH.as_millis() as i64).contains(&(now_ms - c.fetched_at))
+        }
+        None => false,
+    }
 }
 
 static LIMITS: LazyLock<RwLock<Arc<Vec<UsageLimit>>>> = LazyLock::new(|| {
@@ -214,15 +251,35 @@ fn parse_opencode_usage(v: &serde_json::Value, observed_ms: i64) -> Option<Vec<U
     }
 }
 
+/// One-line description of a failed usage-endpoint call. Only the HTTP status
+/// or transport error is reported — never the credential or response body.
+fn http_err(context: &str, e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("{context}: HTTP {code}"),
+        e => format!("{context}: {e}"),
+    }
+}
+
 fn fetch_opencode_go(key: &str) -> Option<Vec<UsageLimit>> {
-    let resp = ureq::get(OPENCODE_GO_USAGE_URL)
+    let resp = match ureq::get(OPENCODE_GO_USAGE_URL)
         .timeout(Duration::from_secs(10))
         .set("accept", "application/json")
         .set("authorization", &format!("Bearer {key}"))
         .call()
-        .ok()?;
-    let v: serde_json::Value = resp.into_json().ok()?;
-    parse_opencode_usage(&v, now_ms())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[tokenscope limits] {}", http_err("opencode-go usage fetch failed", e));
+            return None;
+        }
+    };
+    match resp.into_json::<serde_json::Value>() {
+        Ok(v) => parse_opencode_usage(&v, now_ms()),
+        Err(e) => {
+            eprintln!("[tokenscope limits] opencode-go usage parse failed: {e}");
+            None
+        }
+    }
 }
 
 /// The `accessToken` inside a Claude credential document. Claude Code's file and
@@ -246,6 +303,12 @@ fn claude_access_token(raw: &str) -> Option<String> {
 /// Claude Code suffixes the service with an account hash (`Claude
 /// Code-credentials-48514145`), so the name has to be discovered rather than
 /// assumed; the unsuffixed name stays first for older layouts.
+///
+/// Discovery depends on `security dump-keychain`, which can fail transiently
+/// (e.g. a locked keychain when this app autostarts right after a reboot —
+/// exactly the post-crash case). Discovered names are therefore persisted next
+/// to the limits cache and used as a fallback, so one failed dump does not
+/// blind every later attempt.
 #[cfg(target_os = "macos")]
 fn keychain_credential_services() -> Vec<String> {
     const SERVICE: &str = "Claude Code-credentials";
@@ -272,6 +335,49 @@ fn keychain_credential_services() -> Vec<String> {
     found
 }
 
+/// Union two service lists, discovered names first, deduplicated. Pure so it
+/// can be unit-tested.
+#[cfg(target_os = "macos")]
+fn union_services(discovered: Vec<String>, persisted: Vec<String>) -> Vec<String> {
+    let mut out = discovered;
+    for s in persisted {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Discovered keychain service names, persisted next to the limits cache (names
+/// only — never secrets). Read when `dump-keychain` fails so a transient
+/// failure (locked keychain at autostart after a reboot) does not blind us.
+#[cfg(target_os = "macos")]
+fn services_cache_path() -> Option<PathBuf> {
+    let d = dirs::cache_dir()?.join("tokenscope");
+    let _ = fs::create_dir_all(&d);
+    Some(d.join("claude-keychain-services.json"))
+}
+
+#[cfg(target_os = "macos")]
+fn load_services_cache() -> Vec<String> {
+    services_cache_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn save_services_cache(services: &[String]) {
+    if let Some(path) = services_cache_path() {
+        if let Ok(text) = serde_json::to_string(services) {
+            let tmp = path.with_extension("tmp");
+            if fs::write(&tmp, &text).is_ok() {
+                let _ = fs::rename(&tmp, &path);
+            }
+        }
+    }
+}
+
 /// One keychain item's secret, via `/usr/bin/security`. Reading through the CLI
 /// rather than the Security framework keeps the access grant tied to a stable
 /// system binary: macOS ties it to the asking binary's signature, so an ad-hoc
@@ -293,7 +399,7 @@ fn claude_oauth_tokens() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut add = |t: String| {
         let t = t.trim().to_string();
-        if !t.is_empty() && !out.iter().any(|o| *o == t) {
+        if !t.is_empty() && !out.contains(&t) {
             out.push(t);
         }
     };
@@ -301,10 +407,27 @@ fn claude_oauth_tokens() -> Vec<String> {
         add(v);
     }
     // Claude Code's own copy, where it keeps the credential it refreshes.
+    // Discovery is best-effort (locked keychain right after a reboot); the
+    // persisted names cover a failed dump.
     #[cfg(target_os = "macos")]
-    for svce in keychain_credential_services() {
-        if let Some(t) = keychain_secret(&svce).and_then(|raw| claude_access_token(&raw)) {
-            add(t);
+    {
+        let discovered = keychain_credential_services();
+        if discovered.len() > 1 {
+            save_services_cache(&discovered);
+        }
+        let mut tried = 0;
+        let mut yielded = 0;
+        for svce in union_services(discovered, load_services_cache()) {
+            tried += 1;
+            if let Some(t) = keychain_secret(&svce).and_then(|raw| claude_access_token(&raw)) {
+                yielded += 1;
+                add(t);
+            }
+        }
+        if tried > 0 && yielded == 0 {
+            eprintln!(
+                "[tokenscope limits] keychain: probed {tried} Claude credential service(s), none yielded a token"
+            );
         }
     }
     // `~/.claude/.credentials.json`: { claudeAiOauth: { accessToken, expiresAt } }
@@ -434,16 +557,61 @@ fn parse_claude_usage(v: &serde_json::Value, observed_ms: i64) -> Option<Vec<Usa
     }
 }
 
+/// Keys of the Claude usage response we know how to render. Anything else
+/// carrying a numeric `utilization` is a metered window the provider added
+/// after this parser was written — worth one log line (key names only) so a
+/// future new window shows up in Console.app instead of vanishing silently.
+fn log_unknown_claude_windows(v: &serde_json::Value) {
+    const KNOWN: [&str; 6] = [
+        "five_hour",
+        "seven_day",
+        "seven_day_opus",
+        "seven_day_sonnet",
+        "seven_day_oauth_apps",
+        "limits",
+    ];
+    let Some(obj) = v.as_object() else { return };
+    let mut unknown: Vec<&str> = obj
+        .iter()
+        .filter(|(k, w)| {
+            !KNOWN.contains(&k.as_str())
+                && w.get("utilization").and_then(|u| u.as_f64()).is_some()
+        })
+        .map(|(k, _)| k.as_str())
+        .collect();
+    unknown.sort_unstable();
+    if !unknown.is_empty() {
+        eprintln!(
+            "[tokenscope limits] claude usage has unrecognized metered window(s) not shown in the UI: {}",
+            unknown.join(", ")
+        );
+    }
+}
+
 fn fetch_claude(token: &str) -> Option<Vec<UsageLimit>> {
-    let resp = ureq::get(CLAUDE_USAGE_URL)
+    let resp = match ureq::get(CLAUDE_USAGE_URL)
         .timeout(Duration::from_secs(10))
         .set("accept", "application/json")
         .set("anthropic-beta", CLAUDE_OAUTH_BETA)
         .set("authorization", &format!("Bearer {token}"))
         .call()
-        .ok()?;
-    let v: serde_json::Value = resp.into_json().ok()?;
-    parse_claude_usage(&v, now_ms())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[tokenscope limits] {}", http_err("claude usage fetch failed", e));
+            return None;
+        }
+    };
+    match resp.into_json::<serde_json::Value>() {
+        Ok(v) => {
+            log_unknown_claude_windows(&v);
+            parse_claude_usage(&v, now_ms())
+        }
+        Err(e) => {
+            eprintln!("[tokenscope limits] claude usage parse failed: {e}");
+            None
+        }
+    }
 }
 
 fn sql_f64(v: Option<SqlValue>) -> Option<f64> {
@@ -473,6 +641,13 @@ fn sql_str(v: Option<SqlValue>) -> Option<String> {
     }
 }
 
+/// Set once the first time an Oh My Pi agent db turns out to be unreadable
+/// (schema drift rather than a missing install), so the log gets one line
+/// per process instead of one per 15-minute tick.
+static OMP_SCHEMA_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Same idea for a machine with no Claude OAuth credential anywhere yet.
+static NO_TOKEN_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// Latest reported window per (provider, limit) across every Oh My Pi agent db.
 fn from_omp() -> Vec<UsageLimit> {
     from_omp_dbs(&omp_agent_dbs())
@@ -482,7 +657,7 @@ fn from_omp_dbs(dbs: &[PathBuf]) -> Vec<UsageLimit> {
     let mut best: HashMap<(String, String), UsageLimit> = HashMap::new();
     for db in dbs {
         let Ok(conn) = Connection::open_with_flags(
-            &db,
+            db,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ) else {
             continue;
@@ -492,6 +667,14 @@ fn from_omp_dbs(dbs: &[PathBuf]) -> Vec<UsageLimit> {
                     resets_at, recorded_at
              FROM usage_history",
         ) else {
+            // A missing install is silent (conn.open above already failed);
+            // an unreadable table means Oh My Pi changed its schema.
+            if !OMP_SCHEMA_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[tokenscope limits] oh-my-pi usage_history unreadable in {} (schema drift?); skipping OMP snapshots",
+                    db.display()
+                );
+            }
             continue;
         };
         let Ok(rows) = stmt.query_map([], |r| {
@@ -597,11 +780,12 @@ fn read_cache() -> Option<Cached> {
     serde_json::from_str(&text).ok()
 }
 
-fn write_cache(items: &[UsageLimit]) {
+fn write_cache(items: &[UsageLimit], live_ok: bool) {
     let Some(path) = cache_path() else { return };
     let c = Cached {
         fetched_at: now_ms(),
         items: items.to_vec(),
+        live_ok,
     };
     if let Ok(text) = serde_json::to_string(&c) {
         let tmp = path.with_extension("tmp");
@@ -614,37 +798,66 @@ fn write_cache(items: &[UsageLimit]) {
 /// Refresh the shared snapshot. Returns None when a still-fresh cache means
 /// there is nothing to do, so a background poll that learned nothing doesn't
 /// churn the UI. MUST run off the main thread: the live fetch blocks up to ~10s.
+///
+/// A failed live attempt never counts as fresh (see `live_ok`): the next tick
+/// or restart retries immediately instead of sitting out the FRESH window on
+/// last-known data.
 pub fn reload_shared(force: bool) -> Option<Arc<Vec<UsageLimit>>> {
     let cached = read_cache();
-    if !force {
-        if let Some(c) = cached.as_ref() {
-            let age = now_ms() - c.fetched_at;
-            if (0..FRESH.as_millis() as i64).contains(&age) {
-                return None;
-            }
-        }
+    if should_skip(cached.as_ref(), force, now_ms()) {
+        return None;
     }
     // Precedence, weakest first: the previous snapshot on disk, then what Oh My
     // Pi's poller last recorded, then a live fetch. (A tie is broken by order,
     // and a fresh local read must outrank the copy we cached minutes ago.)
     let restored = cached.map(|c| c.items).unwrap_or_default();
     let mut live = Vec::new();
+    // Whether every provider we attempted yielded rows. Starts true so a
+    // machine with no credentials configured at all is not treated as broken.
+    let mut live_ok = true;
     if let Some(key) = opencode_go_key() {
-        live.extend(fetch_opencode_go(&key).unwrap_or_default());
+        match fetch_opencode_go(&key) {
+            Some(rows) => live.extend(rows),
+            None => live_ok = false,
+        }
     }
     // First token the endpoint accepts wins: the copies expire independently,
     // so a dead one must not shadow a live one.
-    for token in claude_oauth_tokens() {
-        if let Some(items) = fetch_claude(&token) {
-            live.extend(items);
-            break;
+    let tokens = claude_oauth_tokens();
+    if !tokens.is_empty() {
+        let mut accepted = false;
+        for token in &tokens {
+            if let Some(items) = fetch_claude(token) {
+                live.extend(items);
+                accepted = true;
+                break;
+            }
         }
+        if !accepted {
+            // Every copy was rejected (usually: all expired while the machine
+            // was down). Only Claude Code / Oh My Pi refreshing their own
+            // credential heals this — but the retry must keep happening.
+            eprintln!(
+                "[tokenscope limits] claude fetch failed: all {} token(s) rejected; keeping last-known rows and retrying",
+                tokens.len()
+            );
+            live_ok = false;
+        }
+    } else {
+        // No credential anywhere (fresh machine, Claude never logged in).
+        // Retries continue silently apart from this one line per process.
+        if !NO_TOKEN_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[tokenscope limits] claude fetch skipped: no OAuth token in env, keychain, credentials file or Oh My Pi store"
+            );
+        }
+        live_ok = false;
     }
     let items = Arc::new(merge(merge(restored, from_omp()), live));
     if let Ok(mut g) = LIMITS.write() {
         *g = items.clone();
     }
-    write_cache(&items);
+    write_cache(&items, live_ok);
     Some(items)
 }
 
@@ -860,6 +1073,97 @@ mod tests {
 
         drop(conn);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_attempt_never_counts_as_fresh() {
+        let now = 1_790_285_361_000;
+        let fresh_ok = Cached {
+            fetched_at: now - 60_000,
+            items: Vec::new(),
+            live_ok: true,
+        };
+        assert!(should_skip(Some(&fresh_ok), false, now));
+        // same age, but the live fetch failed → must retry, not stall
+        let fresh_failed = Cached {
+            fetched_at: now - 60_000,
+            items: Vec::new(),
+            live_ok: false,
+        };
+        assert!(!should_skip(Some(&fresh_failed), false, now));
+        // an old success is due for a refresh
+        let old_ok = Cached {
+            fetched_at: now - FRESH.as_millis() as i64 - 1,
+            items: Vec::new(),
+            live_ok: true,
+        };
+        assert!(!should_skip(Some(&old_ok), false, now));
+        // force always refetches; no cache never skips
+        assert!(!should_skip(Some(&fresh_ok), true, now));
+        assert!(!should_skip(None, false, now));
+    }
+
+    #[test]
+    fn a_rolled_window_forces_a_refetch() {
+        let now = 1_790_285_361_000;
+        let row = |resets_at_ms: i64| UsageLimit {
+            provider: "anthropic".into(),
+            window: "7 Day".into(),
+            label: "Claude 7 Day".into(),
+            used: 100.0,
+            status: "exhausted".into(),
+            resets_at_ms,
+            observed_ms: now - 60_000,
+            source: "api".into(),
+        };
+        // reset is in the future → still fresh, skip
+        let future = Cached {
+            fetched_at: now - 60_000,
+            items: vec![row(now + 60_000)],
+            live_ok: true,
+        };
+        assert!(should_skip(Some(&future), false, now));
+        // reset just passed → the 100% belongs to a dead window, refetch
+        let rolled = Cached {
+            fetched_at: now - 60_000,
+            items: vec![row(now - 1)],
+            live_ok: true,
+        };
+        assert!(!should_skip(Some(&rolled), false, now));
+        // no reset time reported → ignored, gate behaves as before
+        let unknown = Cached {
+            fetched_at: now - 60_000,
+            items: vec![row(0)],
+            live_ok: true,
+        };
+        assert!(should_skip(Some(&unknown), false, now));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn service_union_prefers_discovery_and_keeps_persisted_fallback() {
+        // dump succeeded: persisted names already covered are not duplicated,
+        // unknown persisted ones are kept as fallback.
+        let out = union_services(
+            vec!["Claude Code-credentials".into(), "Claude Code-credentials-1".into()],
+            vec!["Claude Code-credentials".into(), "Claude Code-credentials-9".into()],
+        );
+        assert_eq!(
+            out,
+            vec![
+                "Claude Code-credentials".to_string(),
+                "Claude Code-credentials-1".to_string(),
+                "Claude Code-credentials-9".to_string(),
+            ]
+        );
+        // dump failed (locked keychain): only the default was discovered, the
+        // persisted suffix still gets probed.
+        let out = union_services(
+            vec!["Claude Code-credentials".into()],
+            vec!["Claude Code-credentials-48514145".into()],
+        );
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&"Claude Code-credentials-48514145".to_string()));
     }
 
     #[test]

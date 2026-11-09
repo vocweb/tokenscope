@@ -27,7 +27,7 @@ pub struct NamedCount {
 }
 
 /// One coding agent's share of a period (Claude Code / Codex / opencode /
-/// Oh My Pi). `name` is the stable source id, `label` the display name.
+/// Oh My Pi / pi). `name` is the stable source id, `label` the display name.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolStat {
     pub name: String,

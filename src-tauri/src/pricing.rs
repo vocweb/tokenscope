@@ -43,6 +43,16 @@ impl ModelPrice {
     }
 }
 
+/// $0 price served for free-tier routes (`*-free`) with no table entry.
+/// `static` (not constructed per call) because `lookup` returns a reference.
+static ZERO_PRICE: ModelPrice = ModelPrice {
+    input: 0.0,
+    output: 0.0,
+    cache_create: 0.0,
+    cache_read: 0.0,
+    cache_create_1h: 0.0,
+};
+
 pub struct Pricing {
     exact: HashMap<String, ModelPrice>,
     norm: HashMap<String, ModelPrice>,
@@ -456,7 +466,17 @@ impl Pricing {
             if let Some(p) = self.exact.get(&canonical) {
                 return Some(p);
             }
-            return self.norm.get(&normalize_key(&canonical));
+            if let Some(p) = self.norm.get(&normalize_key(&canonical)) {
+                return Some(p);
+            }
+        }
+        // Free-tier routes (`*-free`) bill $0 rather than "unknown": without
+        // this the UI reports a priced=false row for models that genuinely cost
+        // nothing. Deliberately NOT a strip-and-reprice (looking up the paid
+        // sibling would overstate cost); a real table entry still wins because
+        // every lookup above runs first.
+        if bare(model).to_ascii_lowercase().ends_with("-free") {
+            return Some(&ZERO_PRICE);
         }
         None
     }
@@ -646,6 +666,34 @@ mod tests {
         p.ingest_litellm(json);
         assert!(approx(p.cost("claude-x", 0.0, 0.0, 0.0, 1e6, 0.0).unwrap(), 11.0));
         assert!(approx(p.cost("claude-x", 0.0, 0.0, 1e6, 0.0, 0.0).unwrap(), 6.25));
+    }
+
+    // Free-tier routes (`*-free`) with no table entry bill $0 instead of
+    // surfacing as unpriced — but a real entry always wins, and the suffix is
+    // never stripped to reprice at the paid sibling's rate.
+    #[test]
+    fn free_suffixed_model_prices_at_zero_but_exact_entry_wins() {
+        let p = empty();
+        let cost = p
+            .cost("deepseek-v4.1-flash-free", 1000.0, 500.0, 0.0, 0.0, 2000.0)
+            .expect("a -free id with no entry must still price");
+        assert_eq!(cost, 0.0);
+
+        let mut q = empty();
+        q.insert("deepseek-v4.1-flash-free", ModelPrice {
+            input: 1e-6,
+            output: 2e-6,
+            cache_create: 0.0,
+            cache_read: 0.0,
+            cache_create_1h: 0.0,
+        });
+        let cost = q
+            .cost("deepseek-v4.1-flash-free", 1000.0, 0.0, 0.0, 0.0, 0.0)
+            .unwrap();
+        assert!(cost > 0.0, "a real table entry beats the $0 fallback");
+
+        // not a free route → still unknown, not zero
+        assert!(p.cost("deepseek-v4.1-flash", 1.0, 0.0, 0.0, 0.0, 0.0).is_none());
     }
 
     // The backstop table prices the moments right after launch and a first run with

@@ -47,7 +47,7 @@
 - 各源 token 口径：Claude Code 直接给出四类；**Codex** 的 `input_tokens` **包含** cached（未缓存部分取差值）、无 cache-write；**opencode** 单独的 `reasoning` 计入 output；**Oh My Pi** 与 Claude Code 一致；**pi** 每条 assistant 消息带 `usage{input, output, cacheRead, cacheWrite, reasoning}`，`reasoning` 计入 output、`cacheWrite` 按 5 分钟缓存计（与 opencode 同口径）
 - **Codex** rollout 同时携带本轮 `last_token_usage` 与会话累计 `total_token_usage`，取本轮值，token 落在真实发生的小时/日期；一个 rollout 文件 = 一个会话
 - **Oh My Pi** 同一会话会拆成多个 agent 日志（`__advisor.*.jsonl`、subagent），归入同一 session，且所有 agent 的 token 都计入
-- MCP / Skill 两个榜单只读 **Claude Code** 日志（白名单来自 Claude 自己的配置）；其他 agent 的工具调用计入其 agent 总量，不进这两个榜单
+- MCP / Skill 两个榜单读取**所有 agent**的日志（白名单是各 agent 自身配置的并集：Claude Code、Codex、opencode、Oh My Pi、pi）；工具调用只要其 server/skill 安装在任一 agent 下即计入
 - 持久化缓存会把**已结束的日期**折叠成 (日期, agent, session, 模型) 一行：只有「今天」需要逐条精度（Day 图 24 个小时桶），否则一天数万次请求的 agent 会把缓存撑到数百 MB
 - token 拆分：`input`(未缓存) / `cache`(creation+read) / `output`；UI 默认把 cache 并入 In 显示，并单列「cached %」
 - 价格匹配：精确名 → 归一化名（去厂商前缀 + `.`↔`p`，如 `glm-5.1`⇄`glm-5p1`）→ 命名空间剥离（`anthropic.claude-opus-5` → `claude-opus-5`）；models.dev 优先官方裸名价

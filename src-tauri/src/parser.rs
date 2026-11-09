@@ -114,14 +114,29 @@ fn vendor_of(model: &str) -> &'static str {
 /// Same build plus whether any log data moved (ingest, prune, compact), so the
 /// caller can skip waking the WebView when nothing changed. Rollup phía trên giữ nguyên, chỉ thêm cờ dirty cho bước refresh.
 pub fn build_dashboard_dirty() -> (Dashboard, bool) {
+    build_inner(false)
+}
+
+/// Quiet-tick build: re-scans only remembered files (no directory listing),
+/// so an idle hidden tick costs a handful of stats. No watcher signal and no
+/// sparse deadline route here; new files wait for the watcher or a full tick.
+/// 静寂tickは既知のみ走査し新規発見はwatcherか疎tickに任せる
+/// Tick lặng chỉ quét file đã nhớ, file mới đợi watcher hoặc tick thưa
+pub fn build_dashboard_quiet() -> (Dashboard, bool) {
+    build_inner(true)
+}
+
+fn build_inner(quiet: bool) -> (Dashboard, bool) {
     let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
     // Loaded once per process; every later build reuses it.
     let store = guard.get_or_insert_with(Store::load);
 
     // 1. Ingest incrementally (full scan only on first run; afterwards just the
     //    appended lines), prune events older than the heatmap window, and
-    //    checkpoint on a schedule rather than on every refresh.
-    let mut dirty = store.ingest();
+    //    checkpoint on a schedule rather than on every refresh. A quiet tick
+    //    re-scans remembered files only — no directory listing — and skips
+    //    discovery of brand-new files (the watcher or a full tick finds them).
+    let mut dirty = if quiet { store.ingest_known() } else { store.ingest() };
     // Sampled once so every window in this build agrees on the current date.
     let now = Local::now();
     let today = now.date_naive();
@@ -1035,4 +1050,38 @@ mod tests {
         assert!(d.emit, "limits change with flat tokens must emit");
         assert!(!d.tray, "tray shows tokens only so flat tokens leave it alone");
     }
+
+    /// Hidden tick schedule: visible panels always run full; hidden ticks go
+    /// quiet (remembered files only) except every fourth tick, the 120s sparse
+    /// deadline that runs a full scan to catch files the watcher may have missed.
+    #[test]
+    fn hidden_ticks_go_quiet_with_a_full_scan_at_the_sparse_deadline() {
+        // 非表示は静寂tickが続き4回毎に全体走査で新規を取りこぼさない
+        // Panel ẩn thì tick lặng xen kẽ tick quét đủ mỗi 4 lần để bắt file mới
+        use crate::{TickKind, SPARSE_EVERY_N_TICKS};
+        assert_eq!(SPARSE_EVERY_N_TICKS, 4);
+        assert_eq!(crate::tick_kind(true, 0), TickKind::Full);
+        assert_eq!(crate::tick_kind(true, 3), TickKind::Full);
+        assert_eq!(crate::tick_kind(false, 0), TickKind::Quiet);
+        assert_eq!(crate::tick_kind(false, 1), TickKind::Quiet);
+        assert_eq!(crate::tick_kind(false, 2), TickKind::Quiet);
+        assert_eq!(crate::tick_kind(false, 3), TickKind::Full);
+        assert_eq!(crate::tick_kind(false, 7), TickKind::Full);
+    }
+
+    /// Quiet hidden ticks cannot hide updates: a dirty ingest must still emit
+    /// so an append to a remembered log still reaches the tray (a brand-new
+    /// file waits for the watcher or the sparse full tick).
+    #[test]
+    fn dirty_ingest_still_pushes_on_a_quiet_tick() {
+        // 非表示でも既知ログの追記は送り続けなければ取りこぼしてしまう
+        // Panel ẩn mà log đã nhớ có thêm dòng thì vẫn phải emit ra tray
+        let dash = dash_with(12.34, 5.67);
+        let d = refresh_decision(true, Some((12.34, 5.67, Vec::new())), &dash);
+        assert!(
+            d.emit && d.tray,
+            "quiet tick with new log data must still reach the tray"
+        );
+    }
 }
+

@@ -8,12 +8,13 @@
 // purely on these in-memory events — cheap, and recomputed per request because
 // the Day/Week/Month windows are relative to "now".
 //
-// Four coding-agent CLIs are ingested, all read-only:
+// Five coding-agent CLIs are ingested, all read-only:
 //
 //   claude   ~/.claude/projects/**/*.jsonl            (Claude Code)
 //   codex    $CODEX_HOME/sessions/**/rollout-*.jsonl  (OpenAI Codex CLI)
 //   opencode ~/.local/share/opencode/storage/message/**/*.json + opencode.db
 //   omp      ~/.omp/**/agent/sessions/**/*.jsonl      (Oh My Pi)
+//   pi       $PI_SESSIONS_DIR (default ~/.pi/agent/sessions/**/*.jsonl)
 //
 // Each source writes a different shape, so each has its own line/file parser
 // below; everything after that (dedupe, manifest, prune, persist) is shared.
@@ -159,7 +160,11 @@ pub struct Store {
 //       message id repeats with a growing `output_tokens`. A v9 cache kept only
 //       the first (opening-chunk) copy, freezing ~69% of Claude Code's output
 //       tokens at zero progress; the cache must be rebuilt to recover them.
-const STORE_VERSION: u32 = 10;
+//   v11: opencode moved its store from `message` to `session_message` (role now
+//       a `type` column, model now a `{id, providerID}` object) and logs tool
+//       calls in `content` blocks; subagent sessions resolve to their root.
+//       A v10 cache holds no opencode MCP/skill facts and unmerged sessions.
+const STORE_VERSION: u32 = 11;
 
 /// Atomically replace `path`'s contents: write a sibling temp file, then rename
 /// over the target (same-volume rename is atomic on Windows and Unix). Avoids
@@ -785,7 +790,8 @@ impl Store {
                 continue;
             };
             let mut state = FileState::default();
-            if let Some(mut ev) = parse_opencode_message(&v, &mut state) {
+            let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("assistant");
+            if let Some(mut ev) = parse_opencode_message(&v, role, &mut state) {
                 ev.source = key;
                 ev.tool = TOOL_OPENCODE.to_string();
                 self.push_event(ev);
@@ -795,10 +801,18 @@ impl Store {
     }
 
     // ── opencode: sqlite store (≥ 1.1) ────────────────────────────────
-    /// `opencode.db` keeps the same message documents in `message.data` (JSON)
-    /// with id/session_id/time_created lifted into columns. Messages are
-    /// rewritten while streaming, so the watermark is `time_updated` (not rowid)
-    /// and a re-read of the boundary row is harmless: `push_event` replaces.
+    /// `opencode.db` keeps message documents as JSON in a table, with
+    /// id/session_id/time_created lifted into columns. Messages are rewritten
+    /// while streaming, so the watermark is `time_updated` (not rowid) and a
+    /// re-read of the boundary row is harmless: `push_event` replaces.
+    ///
+    /// Two schemas exist: the current `session_message` (role in the `type`
+    /// column, model as a `{id, providerID}` object, tool calls in `content`
+    /// blocks) and the legacy `message` (role/modelID inline, no tool calls).
+    /// Detected via `sqlite_master`; the new table wins when both exist. Per
+    /// Q2 the per-message table is the source of truth, not the `session_v2`
+    /// rollups: summed session totals include compacted-away messages and
+    /// cannot be split into day/week/5h windows or per-model rows.
     fn ingest_opencode_db(&mut self) -> bool {
         let Some((_, db)) = opencode_paths() else {
             return false;
@@ -812,6 +826,143 @@ impl Store {
     /// Split from path discovery so the SQL + json join can be exercised against
     /// a throwaway db.
     fn ingest_opencode_db_at(&mut self, db: &Path) -> bool {
+        let Ok(conn) = Connection::open_with_flags(
+            db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
+            .unwrap_or_default();
+        if tables.iter().any(|t| t == "session_message") {
+            return self.ingest_opencode_session_messages_at(db);
+        }
+        if tables.iter().any(|t| t == "message") {
+            return self.ingest_opencode_legacy_messages_at(db);
+        }
+        false
+    }
+
+    /// `id → parent_id` edges from `session_v2`, so subagent sessions fold
+    /// into their root conversation (Q5, same convention as OMP's advisor
+    /// folding). Missing table (legacy DBs) → empty map, ids pass through.
+    /// Unresolvable ids (parent not yet seen) also pass through; a later pass
+    /// fixes them once the parent row arrives.
+    fn opencode_session_parents(db: &Path) -> HashMap<String, String> {
+        let mut map = HashMap::new();
+        let Ok(conn) = Connection::open_with_flags(
+            db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return map;
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, parent_id FROM session_v2 WHERE parent_id IS NOT NULL",
+        ) else {
+            return map;
+        };
+        let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) else {
+            return map;
+        };
+        for row in rows.flatten() {
+            if !row.1.is_empty() {
+                map.insert(row.0, row.1);
+            }
+        }
+        map
+    }
+
+    /// Walk `child → parent` edges to the conversation root, cycle-guarded.
+    fn opencode_root_session(parents: &HashMap<String, String>, id: &str) -> String {
+        let mut cur = id.to_string();
+        for _ in 0..32 {
+            match parents.get(&cur) {
+                Some(p) => cur = p.clone(),
+                None => break,
+            }
+        }
+        cur
+    }
+
+    /// Current schema: `session_message(id, session_id, type, time_created,
+    /// time_updated, data)`.
+    fn ingest_opencode_session_messages_at(&mut self, db: &Path) -> bool {
+        let key = db.to_string_lossy().to_string();
+        let mark = self.manifest.dbs.get(&key).copied().unwrap_or(0);
+        let Ok(conn) = Connection::open_with_flags(
+            db,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return false;
+        };
+        let parents = Self::opencode_session_parents(db);
+        let mut parsed = false;
+        let Ok(mut stmt) = conn.prepare(
+            // The watermark is the `time_updated` *column* (same reasoning as
+            // the legacy table: strict `>` avoids perpetual-dirty re-reads at
+            // the cost of a same-millisecond rewrite being missed).
+            "SELECT id, session_id, type, time_created, time_updated, data FROM session_message WHERE time_updated > ?1",
+        ) else {
+            return false;
+        };
+        let mut max_seen = mark;
+        {
+            let Ok(rows) = stmt.query_map([mark], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            }) else {
+                return false;
+            };
+            for row in rows.flatten() {
+                let (id, session_id, msg_type, time_created, time_updated, data) = row;
+                if msg_type != "assistant" {
+                    max_seen = max_seen.max(time_updated);
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+                    continue;
+                };
+                parsed = true;
+                max_seen = max_seen.max(time_updated);
+                // `data` is the message document minus id/sessionID, which the
+                // table carries in its own columns (see opencode's `info(row)`).
+                let mut v = v;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.entry("id").or_insert(serde_json::Value::String(id));
+                    obj.entry("sessionID")
+                        .or_insert(serde_json::Value::String(session_id.clone()));
+                    obj.entry("time_created")
+                        .or_insert(serde_json::json!(time_created));
+                }
+                let mut state = FileState::default();
+                if let Some(mut ev) = parse_opencode_message(&v, &msg_type, &mut state) {
+                    ev.source = key.clone();
+                    ev.session = Self::opencode_root_session(&parents, &ev.session);
+                    ev.tool = TOOL_OPENCODE.to_string();
+                    self.push_event(ev);
+                }
+            }
+        }
+        // The watermark is the newest `time_updated` we have ingested.
+        if max_seen > mark {
+            self.manifest.dbs.insert(key, max_seen);
+        }
+        parsed || max_seen > mark
+    }
+
+    /// Split from path discovery so the SQL + json join can be exercised against
+    /// a throwaway db.
+    fn ingest_opencode_legacy_messages_at(&mut self, db: &Path) -> bool {
         let key = db.to_string_lossy().to_string();
         let mark = self.manifest.dbs.get(&key).copied().unwrap_or(0);
         let Ok(conn) = Connection::open_with_flags(
@@ -866,7 +1017,8 @@ impl Store {
                         .or_insert(serde_json::json!(time_created));
                 }
                 let mut state = FileState::default();
-                if let Some(mut ev) = parse_opencode_message(&v, &mut state) {
+                let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("assistant");
+                if let Some(mut ev) = parse_opencode_message(&v, role, &mut state) {
                     ev.source = key.clone();
                     ev.tool = TOOL_OPENCODE.to_string();
                     self.push_event(ev);
@@ -1317,10 +1469,22 @@ fn parse_pi_message(v: &serde_json::Value, session: &str) -> Option<RawEvent> {
 /// Both opencode stores hold the same message document:
 /// `{ id, sessionID, role, time: { created }, modelID, providerID,
 ///    tokens: { input, output, reasoning, cache: { read, write } } }`.
-/// `reasoning` is a separate bucket there but has no bucket here (and shares
-/// the output rate), so it is folded into output rather than dropped.
-fn parse_opencode_message(v: &serde_json::Value, _st: &mut FileState) -> Option<RawEvent> {
-    if v.get("role")?.as_str()? != "assistant" {
+/// The current `session_message` schema instead carries the role in the `type`
+/// column and the model as a `{ id, providerID }` object, so the caller passes
+/// the role in and both spellings are read. `reasoning` is a separate bucket
+/// there but has no bucket here (and shares the output rate), so it is folded
+/// into output rather than dropped.
+///
+/// Tool calls live in `content` blocks (`{type:"tool",name,state:{input}}`):
+/// a `skill` block's `input.id` is a skill invocation, any other block name is
+/// an MCP server candidate (built-in tools like `read`/`shell` never match the
+/// installed-server whitelist downstream, so they need no special-casing).
+fn parse_opencode_message(
+    v: &serde_json::Value,
+    role: &str,
+    _st: &mut FileState,
+) -> Option<RawEvent> {
+    if role != "assistant" {
         return None;
     }
     let tokens = v.get("tokens")?;
@@ -1333,6 +1497,14 @@ fn parse_opencode_message(v: &serde_json::Value, _st: &mut FileState) -> Option<
         .and_then(|i| i.as_str())
         .map(|s| s.to_string())
         .unwrap_or_default();
+    let model = v
+        .get("model")
+        .and_then(|m| m.get("id"))
+        .and_then(|m| m.as_str())
+        .or_else(|| v.get("modelID").and_then(|m| m.as_str()))
+        .or_else(|| v.get("model_id").and_then(|m| m.as_str()))
+        .unwrap_or("unknown");
+    let (mcp, skills) = opencode_tool_calls(v.get("content"));
     let num = |x: Option<&serde_json::Value>| x.and_then(|v| v.as_f64()).unwrap_or(0.0);
     Some(RawEvent {
         ts_ms,
@@ -1342,22 +1514,15 @@ fn parse_opencode_message(v: &serde_json::Value, _st: &mut FileState) -> Option<
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
-        model: v
-            .get("modelID")
-            .or_else(|| v.get("model_id"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+        model: model.to_string(),
         in_tok: num(tokens.get("input")),
         cc: num(tokens.pointer("/cache/write")),
         cc_1h: 0.0,
         cr: num(tokens.pointer("/cache/read")),
         out_tok: num(tokens.get("output")) + num(tokens.get("reasoning")),
         n: 1,
-        // opencode puts tool calls in `storage/part/<message>/<part>.json`, not
-        // in the message document, so MCP / skill calls are not counted for it.
-        mcp: Vec::new(),
-        skills: Vec::new(),
+        mcp,
+        skills,
         id: if id.is_empty() {
             String::new()
         } else {
@@ -1366,6 +1531,37 @@ fn parse_opencode_message(v: &serde_json::Value, _st: &mut FileState) -> Option<
         source: String::new(),
         tool: String::new(), // filled in by the caller
     })
+}
+
+/// MCP candidates and skill ids of one opencode assistant message. opencode
+/// names tools flat (`read`, `shell`, `pencil_batch_design`, `skill`), so —
+/// unlike the `mcp__`/`xd_mcp__` prefixes — nothing can be classified here;
+/// every non-skill block name goes out as a candidate and `resolve_mcp` keeps
+/// only the ones matching an installed server.
+fn opencode_tool_calls(content: Option<&serde_json::Value>) -> (Vec<String>, Vec<String>) {
+    let mut mcp = Vec::new();
+    let mut skills = Vec::new();
+    for block in content.and_then(|c| c.as_array()).into_iter().flatten() {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool") {
+            continue;
+        }
+        let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name.is_empty() {
+            continue;
+        }
+        if name == "skill" {
+            if let Some(id) = block
+                .pointer("/state/input/id")
+                .and_then(|i| i.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                skills.push(id.to_string());
+            }
+            continue;
+        }
+        mcp.push(name.to_string());
+    }
+    (mcp, skills)
 }
 
 #[cfg(test)]
@@ -1754,10 +1950,11 @@ mod tests {
         let mut st = FileState::default();
         let ev = parse_opencode_message(
             &line(
-                r#"{"id":"msg_bf7d80110001u0SbKmQxwDwOKt","sessionID":"ses_408","role":"assistant",
+                r#"{"id":"msg_bf7d80110001u0SbKmQxwDwOKt","sessionID":"ses_408",
                     "time":{"created":1769389687056},"modelID":"claude-sonnet-4-5","providerID":"anthropic",
                     "cost":0,"tokens":{"input":6,"output":217,"reasoning":3,"cache":{"read":20365,"write":2909}}}"#,
             ),
+            "assistant",
             &mut st,
         )
         .unwrap();
@@ -1770,10 +1967,159 @@ mod tests {
         assert_eq!(ev.ts_ms, 1769389687056);
         // user messages carry no usage and must not become events
         assert!(parse_opencode_message(
-            &line(r#"{"id":"msg_x","sessionID":"ses_408","role":"user"}"#),
+            &line(r#"{"id":"msg_x","sessionID":"ses_408"}"#),
+            "user",
             &mut st
         )
         .is_none());
+    }
+
+    #[test]
+    fn opencode_new_schema_reads_model_object_and_tool_blocks() {
+        let mut st = FileState::default();
+        let ev = parse_opencode_message(
+            &line(
+                r#"{"id":"msg_1","sessionID":"ses_new","time":{"created":1793008752840},
+                    "model":{"id":"deepseek-v4.1-flash-free","providerID":"opencode","variant":"high"},
+                    "tokens":{"input":10,"output":20,"reasoning":5,"cache":{"read":100,"write":0}},
+                    "content":[{"type":"tool","name":"pencil_batch_design","state":{}},
+                               {"type":"tool","name":"skill","state":{"input":{"id":"writing-for-agents"}}},
+                               {"type":"tool","name":"read","state":{}},
+                               {"type":"text","text":"hi"}]}"#,
+            ),
+            "assistant",
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(ev.model, "deepseek-v4.1-flash-free");
+        // every non-skill block name goes out as a candidate; the
+        // installed-server whitelist downstream drops the built-ins
+        assert_eq!(ev.mcp, vec!["pencil_batch_design", "read"]);
+        assert_eq!(ev.skills, vec!["writing-for-agents"]);
+        assert_eq!(ev.out_tok, 25.0);
+    }
+
+    #[test]
+    fn opencode_session_message_schema_ingests_replaces_and_merges_children() {
+        use rusqlite::params;
+        let dir = std::env::temp_dir().join(format!("tokenscope-oc2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+               id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+               time_created integer NOT NULL, time_updated integer NOT NULL,
+               data text NOT NULL);
+             CREATE TABLE session_v2 (
+               id text PRIMARY KEY, parent_id text)",
+        )
+        .unwrap();
+        // a subagent session parented to the main conversation
+        conn.execute(
+            "INSERT INTO session_v2 (id, parent_id) VALUES (?1, ?2)",
+            params!["ses_child", "ses_main"],
+        )
+        .unwrap();
+        let data = |model: &str, input: u64| {
+            format!(
+                r#"{{"time":{{"created":1793008752840}},
+                     "model":{{"id":"{model}","providerID":"opencode"}},
+                     "tokens":{{"input":{input},"output":5,"reasoning":0,
+                                "cache":{{"read":0,"write":0}}}},
+                     "content":[{{"type":"tool","name":"skill",
+                                  "state":{{"input":{{"id":"retro"}}}}}}]}}"#
+            )
+        };
+        let put = |id: &str, sid: &str, typ: &str, updated: i64, d: &str| {
+            conn.execute(
+                "INSERT OR REPLACE INTO session_message
+                 (id, session_id, type, time_created, time_updated, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, sid, typ, 1793008752840i64, updated, d],
+            )
+            .unwrap();
+        };
+        put("msg_a", "ses_main", "assistant", 1, &data("m1", 10));
+        put("msg_b", "ses_child", "assistant", 2, &data("m1", 7));
+        put("msg_u", "ses_main", "user", 3, r#"{"text":"hi"}"#);
+
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        assert!(s.ingest_opencode_db_at(&db));
+        // the user row advances the watermark but yields no event
+        assert_eq!(s.events.len(), 2);
+        let b = s.events.iter().find(|e| e.id == "oc:msg_b").unwrap();
+        assert_eq!(b.session, "ses_main", "child session folds into its root");
+        assert_eq!(b.tool, TOOL_OPENCODE);
+        assert_eq!(b.skills, vec!["retro"]);
+
+        // Streaming completes: the row is rewritten in place with bigger numbers.
+        put("msg_a", "ses_main", "assistant", 99, &data("m1", 50));
+        assert!(s.ingest_opencode_db_at(&db));
+        assert_eq!(s.events.len(), 2, "an updated row must replace, not duplicate");
+        assert_eq!(
+            s.events.iter().find(|e| e.id == "oc:msg_a").unwrap().in_tok,
+            50.0
+        );
+
+        // Nothing new → nothing to report (and no watermark churn).
+        assert!(!s.ingest_opencode_db_at(&db));
+
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_db_dispatch_prefers_session_message_over_legacy() {
+        use rusqlite::params;
+        let dir = std::env::temp_dir().join(format!("tokenscope-oc3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+               id text PRIMARY KEY, session_id text NOT NULL,
+               time_created integer NOT NULL, time_updated integer NOT NULL,
+               data text NOT NULL);
+             CREATE TABLE session_message (
+               id text PRIMARY KEY, session_id text NOT NULL, type text NOT NULL,
+               time_created integer NOT NULL, time_updated integer NOT NULL,
+               data text NOT NULL)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('m_old', 's_old', 1, 1,
+                     '{\"role\":\"assistant\",\"time\":{\"created\":1},\"modelID\":\"x\",\"tokens\":{\"input\":1,\"output\":1}}')",
+            params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, time_created, time_updated, data)
+             VALUES ('m_new', 's_new', 'assistant', 2, 2,
+                     '{\"time\":{\"created\":2},\"model\":{\"id\":\"y\"},\"tokens\":{\"input\":2,\"output\":2}}')",
+            params![],
+        )
+        .unwrap();
+
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        assert!(s.ingest_opencode_db_at(&db));
+        assert_eq!(s.events.len(), 1);
+        assert_eq!(s.events[0].id, "oc:m_new");
+        assert_eq!(s.events[0].model, "y");
+
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

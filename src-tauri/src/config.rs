@@ -61,6 +61,26 @@ fn mcps_from_agent_file(path: &Path) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// opencode's own config (`~/.config/opencode/opencode.json`) declares servers
+/// under a top-level `"mcp"` object — `{ "mcp": { "<server>": { … } } }` — not
+/// the `"mcpServers"` shape Claude Code uses, so it needs its own reader.
+/// Without this every opencode MCP call is dropped by `resolve_mcp`.
+fn mcps_from_opencode_config(path: &Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let Ok(text) = fs::read_to_string(path) else {
+        return set;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return set;
+    };
+    if let Some(obj) = json.get("mcp").and_then(|v| v.as_object()) {
+        for k in obj.keys() {
+            set.insert(k.clone());
+        }
+    }
+    set
+}
+
 /// `[mcp_servers.<name>]` table headers in Codex's TOML config. Read line-wise
 /// so one key needs no TOML parser; a header is the only place a server is
 /// declared, and indentation/inline tables can't be confused with it.
@@ -178,6 +198,9 @@ impl UserConfig {
         }
         if let Some(h) = home() {
             mcp_servers.extend(mcps_from_codex_toml(&h.join(".codex").join("config.toml")));
+            mcp_servers.extend(
+                mcps_from_opencode_config(&h.join(".config").join("opencode").join("opencode.json")),
+            );
         }
         UserConfig {
             mcp_servers,
@@ -288,6 +311,26 @@ mod tests {
         let found = mcps_from_codex_toml(&path);
         assert_eq!(found.len(), 2, "a nested `.env` table is not a server: {found:?}");
         assert!(found.contains("unityMCP") && found.contains("pencil"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_mcp_servers_are_read_from_the_mcp_object() {
+        let dir = std::env::temp_dir().join(format!("ts-cfg-oc-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("opencode.json");
+        fs::write(
+            &path,
+            r#"{"mcp":{"pencil":{"command":["x"],"type":"local"},
+                        "my-server":{"url":"http://127.0.0.1:8080/mcp"}},
+                 "plugin":["@vocweb/opencode-advisor"]}"#,
+        )
+        .unwrap();
+        let found = mcps_from_opencode_config(&path);
+        assert_eq!(found.len(), 2);
+        assert!(found.contains("pencil") && found.contains("my-server"));
+        // missing / invalid → empty, never an error
+        assert!(mcps_from_opencode_config(&dir.join("nope.json")).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

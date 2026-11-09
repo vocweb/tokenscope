@@ -207,6 +207,20 @@ fn opencode_paths() -> Option<(PathBuf, PathBuf)> {
         root.join("opencode.db"),
     ))
 }
+/// DBやWALの書き込みでリフレッシュが空回りするので監視対象をログ領域に絞る。
+/// Vùng dữ liệu hay biến động của tác tử đang chạy được loại khỏi giám sát, chỉ giữ vùng nhật ký tin nhắn và đường dẫn cơ sở dữ liệu.
+fn opencode_watch_roots_for(data_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let msg_dir = data_dir.join("storage").join("message");
+    if msg_dir.is_dir() {
+        roots.push(msg_dir);
+    }
+    let db = data_dir.join("opencode.db");
+    if db.is_file() {
+        roots.push(db);
+    }
+    roots
+}
 
 /// Oh My Pi keeps one agent dir per profile: ~/.omp/agent plus
 /// ~/.omp/profiles/<name>/agent. Sessions live under <agent>/sessions/<project>/
@@ -245,9 +259,7 @@ pub fn watch_roots() -> Vec<PathBuf> {
         }
     }
     if let Some(opencode) = opencode_data_dir() {
-        if opencode.is_dir() {
-            roots.push(opencode);
-        }
+        roots.extend(opencode_watch_roots_for(&opencode));
     }
     for omp in omp_session_roots() {
         if omp.is_dir() {
@@ -1892,6 +1904,39 @@ mod tests {
         assert_eq!(ev.ts_ms, 1790159886476); // message.timestamp wins over the entry's string
         assert_eq!(ev.model, "claude-sonnet-5");
         assert!(parse_omp_line(&line(r#"{"type":"title","title":"x"}"#), "s").is_none());
+    }
+
+    #[test]
+    fn opencode_watch_excludes_churn_but_keeps_message_log() {
+        let root = std::env::temp_dir()
+            .join(format!("tokenscope-ocw-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let msg_dir = root.join("storage").join("message").join("ses_1");
+        fs::create_dir_all(&msg_dir).unwrap();
+        fs::write(msg_dir.join("msg_a.json"), "{}").unwrap();
+        for f in ["opencode.db", "opencode.db-wal", "opencode.db-shm", "auth.json"] {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        let roots = opencode_watch_roots_for(&root);
+        assert!(roots.contains(&root.join("storage").join("message")));
+        assert!(roots.contains(&root.join("opencode.db")));
+        assert!(!roots.contains(&root));
+        assert!(roots.iter().all(|r| {
+            r.file_name()
+                .map(|n| n != "auth.json" && !n.to_string_lossy().ends_with("-wal") && !n.to_string_lossy().ends_with("-shm"))
+                .unwrap_or(true)
+        }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opencode_watch_is_empty_when_nothing_to_watch() {
+        let root = std::env::temp_dir()
+            .join(format!("tokenscope-ocw-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert!(opencode_watch_roots_for(&root).is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -111,7 +111,9 @@ fn vendor_of(model: &str) -> &'static str {
     }
 }
 
-pub fn build_dashboard() -> Dashboard {
+/// Same build plus whether any log data moved (ingest, prune, compact), so the
+/// caller can skip waking the WebView when nothing changed. Rollup phía trên giữ nguyên, chỉ thêm cờ dirty cho bước refresh.
+pub fn build_dashboard_dirty() -> (Dashboard, bool) {
     let mut guard = STORE.lock().unwrap_or_else(|e| e.into_inner());
     // Loaded once per process; every later build reuses it.
     let store = guard.get_or_insert_with(Store::load);
@@ -182,7 +184,7 @@ pub fn build_dashboard() -> Dashboard {
         .map(|e| (e.input + e.cache + e.output) / 1e6)
         .sum();
 
-    Dashboard {
+    let dash = Dashboard {
         day,
         week,
         month,
@@ -191,8 +193,69 @@ pub fn build_dashboard() -> Dashboard {
         heatmap,
         today_tokens,
         generated_at: now.to_rfc3339(),
+    };
+    (dash, dirty)
+}
+
+/// Whether one background refresh must wake the WebView (`emit`) or refresh the
+/// tray number (`tray`). Costs ride along because a price refresh can move them
+/// while tokens sit still. Token とコストの両方を見ることで価格更新の見落としを防ぐ
+/// Nhìn cả token lẫn chi phí để không bỏ sót lần refresh bảng giá làm đổi chi phí
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshDecision {
+    pub emit: bool,
+    pub tray: bool,
+}
+
+// Last snapshot the UI was told about (today M tokens, day USD cost, plan
+// limits). Compared by the gate below; only rewritten on emit so a skipped
+// tick keeps its baseline.
+// emit時にだけ進むため見送りtickは比較基準を汚さない
+// Chỉ tiến khi emit nên tick bị bỏ qua không làm bẩn mốc so sánh
+static LAST_PUSHED: Mutex<Option<(f64, f64, Vec<crate::limits::UsageLimit>)>> = Mutex::new(None);
+
+/// Pure gate: new log data always pushes; a clean build pushes only when today
+/// totals, estimated cost, or plan limits moved. The tray follows token moves
+/// only (limits/cost never show there).
+/// ログ新規は常時送りそれ以外は数値変化時のみ送る
+/// Có log mới thì luôn emit, còn lại chỉ emit khi con số đổi
+
+pub fn refresh_decision(dirty: bool, prev: Option<(f64, f64, Vec<crate::limits::UsageLimit>)>, dash: &Dashboard) -> RefreshDecision {
+    let cur = (dash.today_tokens, dash.day.metrics.cost, dash.limits.clone());
+    match prev {
+        None => RefreshDecision { emit: true, tray: true },
+        Some((p_tokens, p_cost, p_limits)) => {
+            let tokens_moved = p_tokens != cur.0;
+            let limits_moved = p_limits != cur.2;
+            RefreshDecision {
+                // dirty keeps the current live path (tray always set); a clean
+                // build touches the tray only when the token number moved
+                emit: dirty || tokens_moved || p_cost != cur.1 || limits_moved,
+                tray: dirty || tokens_moved,
+            }
+        }
     }
 }
+
+/// Stateful gate for `refresh()`: compares against the last pushed totals and
+/// remembers the new ones whenever it emits. Tray implies emit (a moved token
+/// number always pushes), so recording on emit alone keeps the baseline exact.
+/// emit時のみ基準を更新しtray単独更新は起きないため基準がずれない
+/// Chỉ cập nhật mốc khi emit và tray luôn đi kèm emit nên mốc không bao giờ lệch
+pub fn decide_refresh(dirty: bool, dash: &Dashboard) -> RefreshDecision {
+    let cur = (dash.today_tokens, dash.day.metrics.cost, dash.limits.clone());
+    let mut slot = LAST_PUSHED.lock().unwrap_or_else(|e| e.into_inner());
+    let d = refresh_decision(dirty, slot.clone(), dash);
+    if d.emit {
+        *slot = Some(cur);
+    }
+    d
+}
+
+pub fn build_dashboard() -> Dashboard {
+    build_dashboard_dirty().0
+}
+
 
 /// Write the store out if a refresh left changes uncheckpointed. Called when the
 /// app exits, so a clean quit never makes the next launch re-read everything
@@ -875,5 +938,101 @@ mod tests {
                 assert!(p.label.is_empty());
             }
         }
+    }
+    // 小さなダッシュボード複製でemit判定だけを直接検証できるようにする
+    // Dựng dashboard gọn để kiểm tra trực tiếp quyết định emit mà không cần log thật
+    fn dash_with(today_tokens: f64, day_cost: f64) -> Dashboard {
+        let mut metrics = Metrics::default();
+        metrics.cost = day_cost;
+        let report = PeriodReport {
+            metrics,
+            series: Vec::new(),
+            models: Vec::new(),
+            tools: Vec::new(),
+            mcp: Vec::new(),
+            skills: Vec::new(),
+            req_trend: Vec::new(),
+            cost_trend: Vec::new(),
+        };
+        Dashboard {
+            day: report.clone(),
+            week: report.clone(),
+            month: report.clone(),
+            five_hour: report,
+            limits: Vec::new(),
+            heatmap: Vec::new(),
+            today_tokens,
+            generated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn clean_build_with_same_totals_stays_silent() {
+        // ログも合計も不変なら描画先を起こさないことが節電の核心である
+        // Log và các tổng đều đứng yên thì không đánh thức WebView, đó là cốt lõi tiết kiệm CPU
+        let dash = dash_with(12.34, 5.67);
+        let d = refresh_decision(false, Some((12.34, 5.67, Vec::new())), &dash);
+        assert!(!d.emit, "clean build with same totals must not emit");
+        assert!(!d.tray, "clean build with same totals must not touch tray");
+    }
+
+    #[test]
+    fn new_log_data_still_pushes_even_when_today_totals_match() {
+        // 新規ログは週月集計を動かすため今日の合計一致でも送り続ける
+        // Log mới có thể làm đổi báo cáo tuần và tháng nên vẫn emit dù tổng hôm nay trùng nhau
+        let dash = dash_with(12.34, 5.67);
+        let d = refresh_decision(true, Some((12.34, 5.67, Vec::new())), &dash);
+        assert!(d.emit, "new log data must always emit");
+        assert!(d.tray, "new log data keeps the live tray behavior");
+    }
+
+    #[test]
+    fn cost_move_with_flat_tokens_still_pushes_without_touching_tray() {
+        // 価格表更新はトークン不変でコストだけ動かすため隠してはならない
+        // Refresh bảng giá đổi chi phí trong khi token phẳng nên tuyệt đối không được giấu
+        let dash = dash_with(12.34, 5.68);
+        let d = refresh_decision(false, Some((12.34, 5.67, Vec::new())), &dash);
+        assert!(d.emit, "cost change with flat tokens must emit");
+        assert!(!d.tray, "tray shows tokens only so flat tokens leave it alone");
+    }
+
+    #[test]
+    fn token_move_updates_tray_and_pushes() {
+        // 隠れたpanelの代わりにtrayの数字が真実になるため必ず更新する
+        // Khi panel ẩn thì con số trên tray là nguồn sự thật nên token đổi là phải cập nhật
+        let dash = dash_with(12.35, 5.67);
+        let d = refresh_decision(false, Some((12.34, 5.67, Vec::new())), &dash);
+        assert!(d.emit, "token change must emit");
+        assert!(d.tray, "token change must refresh the tray number");
+    }
+
+    #[test]
+    fn first_refresh_after_launch_pushes() {
+        // 初回は比較対象がないため現在値をそのまま送り基準を確立する
+        // Lần đầu chưa có mốc so sánh nên cứ emit để thiết lập mốc hiện tại
+        let dash = dash_with(0.0, 0.0);
+        let d = refresh_decision(false, None, &dash);
+        assert!(d.emit, "first refresh has no baseline so it must emit");
+        assert!(d.tray, "first refresh has no baseline so it must set tray");
+    }
+
+    #[test]
+    fn limits_move_with_flat_tokens_still_pushes_without_touching_tray() {
+        // 手動更新後のplan枠変化を見落とさないための回帰防止である
+        // Giữ hành vi live sau Refresh thủ công nên khung plan đổi là phải emit
+        let mut dash = dash_with(12.34, 5.67);
+        dash.limits.push(crate::limits::UsageLimit {
+            provider: "opencode-go".to_string(),
+            window: "5 Hour".to_string(),
+            label: "5h".to_string(),
+            used: 80.0,
+            status: "warning".to_string(),
+            resets_at_ms: 0,
+            observed_ms: 0,
+            source: "api".to_string(),
+        });
+        let d = refresh_decision(false, Some((12.34, 5.67, Vec::new())), &dash);
+        assert!(d.emit, "limits change with flat tokens must emit");
+        assert!(!d.tray, "tray shows tokens only so flat tokens leave it alone");
     }
 }

@@ -33,20 +33,28 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Rebuild the dashboard (incremental), update the tray's token count, and push
-/// the fresh data to the UI so an open popover updates live.
+/// Rebuild the dashboard (incremental); push it to the UI only when something
+/// changed, so an idle app leaves the WebView asleep. The tray number still
+/// follows every token move because it is the source of truth while hidden.
+/// 変化なしtickは描画を起こさずtrayの数字だけを保つ
+/// Tick không đổi thì không đánh thức WebView, chỉ giữ con số trên tray
 fn refresh(app: &tauri::AppHandle) {
-    let dash = parser::build_dashboard();
-    if let Some(tray) = app.tray_by_id("main") {
-        let label = fmt_tokens_m(dash.today_tokens);
-        // macOS shows the label next to the menu-bar icon (set_title). Windows'
-        // taskbar tray has no equivalent — set_title is a no-op there — so we
-        // surface the same number through the hover tooltip instead, the only
-        // text channel Shell_NotifyIcon exposes for a tray icon.
-        let _ = tray.set_title(Some(label.clone()));
-        let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
+    let (dash, dirty) = parser::build_dashboard_dirty();
+    let d = parser::decide_refresh(dirty, &dash);
+    if d.tray {
+        if let Some(tray) = app.tray_by_id("main") {
+            let label = fmt_tokens_m(dash.today_tokens);
+            // macOS shows the label next to the menu-bar icon (set_title). Windows'
+            // taskbar tray has no equivalent — set_title is a no-op there — so we
+            // surface the same number through the hover tooltip instead, the only
+            // text channel Shell_NotifyIcon exposes for a tray icon.
+            let _ = tray.set_title(Some(label.clone()));
+            let _ = tray.set_tooltip(Some(format!("Tokenscope · today {}", label)));
+        }
     }
-    let _ = app.emit("dashboard-updated", &dash);
+    if d.emit {
+        let _ = app.emit("dashboard-updated", &dash);
+    }
 }
 
 // ── Detached window (an ordinary app window) ────────────────────────

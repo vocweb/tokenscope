@@ -38,8 +38,12 @@ fn now_ms() -> i64 {
 /// follows every token move because it is the source of truth while hidden.
 /// 変化なしtickは描画を起こさずtrayの数字だけを保つ
 /// Tick không đổi thì không đánh thức WebView, chỉ giữ con số trên tray
-fn refresh(app: &tauri::AppHandle) {
-    let (dash, dirty) = parser::build_dashboard_dirty();
+fn refresh_inner(app: &tauri::AppHandle, quiet: bool) {
+    let (dash, dirty) = if quiet {
+        parser::build_dashboard_quiet()
+    } else {
+        parser::build_dashboard_dirty()
+    };
     let d = parser::decide_refresh(dirty, &dash);
     if d.tray {
         if let Some(tray) = app.tray_by_id("main") {
@@ -54,6 +58,65 @@ fn refresh(app: &tauri::AppHandle) {
     }
     if d.emit {
         let _ = app.emit("dashboard-updated", &dash);
+    }
+}
+
+fn refresh(app: &tauri::AppHandle) {
+    refresh_inner(app, false)
+}
+
+fn refresh_quiet(app: &tauri::AppHandle) {
+    refresh_inner(app, true)
+}
+
+/// Background poll cadence while the panel is hidden (both popover and detached
+/// window): fast 30s ticks keep running but go quiet — they re-scan remembered
+/// files only ([`Store::ingest_known`], no directory listing) — and every
+/// fourth tick (120s sparse deadline) runs a full scan to discover brand-new
+/// files the watcher may have missed. While any panel is on screen every tick
+/// runs full. Watching stays the primary change signal either way; opening the
+/// panel refetches instantly, so hidden staleness never shows.
+/// 非表示は30秒毎の静寂tickと120秒毎の全体走査で待機電力を抑える
+/// Panel ẩn: tick 30s chỉ quét file đã nhớ, tick 120s quét đủ để bắt file mới
+pub const POLL_FAST_SECS: u64 = 30;
+pub const SPARSE_EVERY_N_TICKS: u32 = 4;
+
+/// What one background tick should do: a `Full` scan (discover new files) or
+/// a `Quiet` re-scan of remembered files only (no directory listing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickKind {
+    Full,
+    Quiet,
+}
+
+/// Tick schedule: visible panels always run full; hidden ticks run full only
+/// at the sparse deadline (every `SPARSE_EVERY_N_TICKS`-th tick), quiet
+/// otherwise. `hidden_ticks` counts consecutive hidden ticks (reset on open).
+pub fn tick_kind(panel_visible: bool, hidden_ticks: u32) -> TickKind {
+    if panel_visible || hidden_ticks % SPARSE_EVERY_N_TICKS == SPARSE_EVERY_N_TICKS - 1 {
+        TickKind::Full
+    } else {
+        TickKind::Quiet
+    }
+}
+
+/// Either surface is on screen: the detached window (tracked state) or the
+/// popover (NSPanel on macOS, plain window elsewhere).
+fn panel_visible(app: &tauri::AppHandle) -> bool {
+    if is_detached_open(app) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        app.get_webview_panel("main")
+            .map(|p| p.is_visible())
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        app.get_webview_window("main")
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false)
     }
 }
 
@@ -1130,19 +1193,33 @@ pub fn run() {
             });
 
             // Background refresh: keep the tray's token count current and push
-            // live updates to an open popover. Cheap thanks to incremental ingest.
+            // live updates to an open popover. Hidden ticks keep the 30s quantum
+            // but go quiet (remembered files only, no tree walk); every fourth
+            // hidden tick runs a full scan as the sparse deadline. The watcher
+            // below stays the primary change signal, and opening the panel
+            // refetches instantly, so the slowdown only skips no-op work.
             let handle = app.handle().clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(30));
-                refresh(&handle);
+            std::thread::spawn(move || {
+                let mut hidden_ticks: u32 = 0;
+                loop {
+                    std::thread::sleep(Duration::from_secs(POLL_FAST_SECS));
+                    let visible = panel_visible(&handle);
+                    let kind = tick_kind(visible, hidden_ticks);
+                    hidden_ticks = if visible { 0 } else { hidden_ticks.wrapping_add(1) };
+                    match kind {
+                        TickKind::Full => refresh(&handle),
+                        TickKind::Quiet => refresh_quiet(&handle),
+                    }
+                }
             });
 
             // Filesystem watcher: reflect a log write within ~1s instead of
-            // waiting up to the 30s poll (PRD wants <=5s). Writes land in the
+            // waiting for the next tick (PRD wants <=5s). Writes land in the
             // agent dirs store::watch_roots() reports (Claude Code, Codex,
             // opencode, Oh My Pi); our own cache lives elsewhere, so this never
             // self-triggers. Debounced so a burst of writes coalesces into one
-            // rebuild; the 30s poll above stays as a fallback. (build_dashboard
+            // rebuild; the poll above stays as a fallback (hidden ticks go
+            // quiet, with a full scan every fourth tick). (build_dashboard
             // serializes on the store lock, so this and the poll can't race.)
             let roots = store::watch_roots();
             if !roots.is_empty() {

@@ -8,7 +8,9 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+#[derive(Clone, Default)]
 pub struct UserConfig {
     pub mcp_servers: HashSet<String>,
     pub skills: HashSet<String>,
@@ -33,6 +35,7 @@ fn mcps_from_document(json: &serde_json::Value) -> HashSet<String> {
 }
 
 /// Parse ~/.claude.json once (None if missing/unreadable/invalid).
+#[allow(dead_code)]
 fn read_user_config() -> Option<serde_json::Value> {
     let path = home()?.join(".claude.json");
     let text = fs::read_to_string(path).ok()?;
@@ -147,6 +150,7 @@ fn agent_dirs() -> Vec<PathBuf> {
 /// installs from plugins. Project-level skill dirs are not scanned: they are
 /// per-project content, not an install, and folding them in inflates the
 /// "installed skills" metric.
+#[allow(dead_code)]
 fn load_user_skills() -> HashSet<String> {
     let mut set = HashSet::new();
     if let Some(h) = home() {
@@ -162,6 +166,99 @@ fn load_user_skills() -> HashSet<String> {
     set
 }
 
+/// Scan every config source under one home plus the given agent dirs.
+/// Takes the roots as parameters so tests can point at temp dirs; the
+/// production caller passes the real home and `agent_dirs()`.
+fn scan_sources(home: &Path, agents: &[PathBuf]) -> UserConfig {
+    let text = fs::read_to_string(home.join(".claude.json")).ok();
+    let parsed: Option<serde_json::Value> = text.and_then(|t| serde_json::from_str(&t).ok());
+    let mut mcp_servers = mcps_from(parsed.as_ref());
+    for dir in agents {
+        mcp_servers.extend(mcps_from_agent_file(&dir.join("mcp.json")));
+    }
+    mcp_servers.extend(mcps_from_codex_toml(&home.join(".codex").join("config.toml")));
+    let mut skills = HashSet::new();
+    scan_skill_dir(&home.join(".claude").join("skills"), &mut skills);
+    scan_plugin_skills(
+        &home.join(".omp").join("plugins").join("node_modules"),
+        &mut skills,
+    );
+    for dir in agents {
+        scan_skill_dir(&dir.join("skills"), &mut skills);
+    }
+    UserConfig {
+        mcp_servers,
+        skills,
+    }
+}
+/// 前回結果とmtime群を保持し再読込を抑えるキャッシュ。
+/// Ghi nhớ kết quả quét và mtime để bỏ qua lần quét lại khi không đổi.
+#[derive(Default)]
+struct CachedConfig {
+    config: UserConfig,
+    snap: Vec<Option<SystemTime>>,
+    at: Option<Instant>,
+    #[cfg(test)]
+    scans: u32,
+}
+
+impl CachedConfig {
+    /// mtime不変でも再走査するまでの保持時間で新規導入を拾う。
+    /// TTL giữ kết quả quét dù mtime không đổi, đủ nhanh cho cài đặt mới.
+    const TTL: Duration = Duration::from_secs(5 * 60);
+
+    fn source_paths(home: &Path, agents: &[PathBuf]) -> Vec<PathBuf> {
+        let mut paths = vec![
+            home.join(".claude.json"),
+            home.join(".codex").join("config.toml"),
+            home.join(".claude").join("skills"),
+            home.join(".omp").join("plugins").join("node_modules"),
+            home.join(".omp").join("profiles"),
+        ];
+        for dir in agents {
+            paths.push(dir.join("mcp.json"));
+            paths.push(dir.join("skills"));
+        }
+        paths
+    }
+
+    fn fingerprint(home: &Path, agents: &[PathBuf]) -> Vec<Option<SystemTime>> {
+        Self::source_paths(home, agents)
+            .iter()
+            .map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+            .collect()
+    }
+
+    fn stale(&self, home: &Path, agents: &[PathBuf], now: Instant) -> bool {
+        let Some(at) = self.at else { return true };
+        if Self::fingerprint(home, agents) != self.snap {
+            return true;
+        }
+        now.duration_since(at) >= Self::TTL
+    }
+
+    fn replace(&mut self, scanned: UserConfig, home: &Path, agents: &[PathBuf], now: Instant) {
+        self.config = scanned;
+        self.snap = Self::fingerprint(home, agents);
+        self.at = Some(now);
+    }
+
+    /// Shared refresh path for production and tests: rescan only when a
+    /// source mtime moved or the TTL elapsed, else return the cached result.
+    fn load_from(&mut self, home: &Path, agents: &[PathBuf], now: Instant) -> UserConfig {
+        if !self.stale(home, agents, now) {
+            return self.config.clone();
+        }
+        #[cfg(test)]
+        {
+            self.scans += 1;
+        }
+        let scanned = scan_sources(home, agents);
+        self.replace(scanned, home, agents, now);
+        self.config.clone()
+    }
+}
+
 /// Agents spell the same server differently — `unity-mcp` in a config,
 /// `UnityMCP` in Claude Code's own project entry, `chrome-devtools` in Oh My
 /// Pi's mcp.json against `chrome_devtools` inside its tool names — so case and
@@ -172,17 +269,17 @@ fn normalize_server(name: &str) -> String {
 
 impl UserConfig {
     pub fn load() -> Self {
-        let mut mcp_servers = mcps_from(read_user_config().as_ref());
-        for dir in agent_dirs() {
-            mcp_servers.extend(mcps_from_agent_file(&dir.join("mcp.json")));
-        }
-        if let Some(h) = home() {
-            mcp_servers.extend(mcps_from_codex_toml(&h.join(".codex").join("config.toml")));
-        }
-        UserConfig {
-            mcp_servers,
-            skills: load_user_skills(),
-        }
+        static CACHE: LazyLock<Mutex<CachedConfig>> =
+            LazyLock::new(|| Mutex::new(CachedConfig::default()));
+        // スキャンが高コストなので保持したロック下で重複実行を抑える。
+        // Giữ khoá suốt quá trình quét để hai luồng không quét trùng lặp.
+        let mut guard = CACHE.lock().unwrap();
+        let Some(home) = home() else {
+            return guard.config.clone();
+        };
+        let agents = agent_dirs();
+        let now = Instant::now();
+        guard.load_from(&home, &agents, now)
     }
 
     /// Resolve a tool name's server candidate against the installed servers,
@@ -289,5 +386,78 @@ mod tests {
         assert_eq!(found.len(), 2, "a nested `.env` table is not a server: {found:?}");
         assert!(found.contains("unityMCP") && found.contains("pencil"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unchanged_sources_reuse_the_cached_result() {
+        use std::time::{Duration, Instant};
+        let home = temp_home("cache-hit");
+        write_text(&home.join(".claude.json"), r#"{"mcpServers":{"alpha":{}}}"#);
+        let agents = vec![home.join("agents").join("a")];
+        write_text(&agents[0].join("mcp.json"), r#"{"mcpServers":{"beta":{}}}"#);
+        fs::create_dir_all(home.join(".claude").join("skills").join("my-skill")).unwrap();
+        let t0 = Instant::now();
+        let mut cache = CachedConfig::default();
+        let first = cache.load_from(&home, &agents, t0);
+        assert!(first.mcp_servers.contains("alpha"));
+        assert!(first.mcp_servers.contains("beta"));
+        assert!(first.skills.contains("my-skill"));
+        assert_eq!(cache.scans, 1);
+        // same sources, well within the TTL: no rescan
+        let second = cache.load_from(&home, &agents, t0 + Duration::from_secs(59));
+        assert_eq!(cache.scans, 1, "same mtimes within TTL must not rescan");
+        assert_eq!(second.mcp_servers, first.mcp_servers);
+        assert_eq!(second.skills, first.skills);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn moved_source_mtime_triggers_a_rescan() {
+        use std::time::{Duration, Instant};
+        let home = temp_home("cache-mtime");
+        write_text(&home.join(".claude.json"), r#"{"mcpServers":{}}"#);
+        let agents = vec![home.join("agents").join("a")];
+        write_text(&agents[0].join("mcp.json"), r#"{"mcpServers":{"beta":{}}}"#);
+        let t0 = Instant::now();
+        let mut cache = CachedConfig::default();
+        let first = cache.load_from(&home, &agents, t0);
+        assert!(!first.mcp_servers.contains("gamma"));
+        // installing another server rewrites the file, moving its mtime
+        write_text(
+            &agents[0].join("mcp.json"),
+            r#"{"mcpServers":{"beta":{},"gamma":{}}}"#,
+        );
+        let second = cache.load_from(&home, &agents, t0 + Duration::from_secs(1));
+        assert_eq!(cache.scans, 2, "moved mtime must rescan");
+        assert!(second.mcp_servers.contains("gamma"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn expired_ttl_triggers_a_rescan() {
+        use std::time::{Duration, Instant};
+        let home = temp_home("cache-ttl");
+        write_text(&home.join(".claude.json"), r#"{"mcpServers":{}}"#);
+        let agents: Vec<PathBuf> = Vec::new();
+        let t0 = Instant::now();
+        let mut cache = CachedConfig::default();
+        cache.load_from(&home, &agents, t0);
+        assert_eq!(cache.scans, 1);
+        // nothing changed on disk, but the TTL elapsed: rescan anyway
+        cache.load_from(&home, &agents, t0 + Duration::from_secs(6 * 60));
+        assert_eq!(cache.scans, 2, "expired TTL must rescan");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    fn temp_home(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ts-cfg-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_text(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
     }
 }

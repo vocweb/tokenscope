@@ -70,8 +70,8 @@ fn refresh_quiet(app: &tauri::AppHandle) {
 }
 
 /// Background poll cadence while the panel is hidden (both popover and detached
-/// window): fast 30s ticks keep running but go quiet — they re-scan remembered
-/// files only ([`Store::ingest_known`], no directory listing) — and every
+/// window): fast 30s ticks keep running but go quiet - they re-scan remembered
+/// files only ([`Store::ingest_known`], no directory listing) - and every
 /// fourth tick (120s sparse deadline) runs a full scan to discover brand-new
 /// files the watcher may have missed. While any panel is on screen every tick
 /// runs full. Watching stays the primary change signal either way; opening the

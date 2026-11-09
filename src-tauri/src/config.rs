@@ -34,14 +34,6 @@ fn mcps_from_document(json: &serde_json::Value) -> HashSet<String> {
     set
 }
 
-/// Parse ~/.claude.json once (None if missing/unreadable/invalid).
-#[allow(dead_code)]
-fn read_user_config() -> Option<serde_json::Value> {
-    let path = home()?.join(".claude.json");
-    let text = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
 /// mcpServers (top level) + projects[*].mcpServers from a parsed ~/.claude.json.
 fn mcps_from(json: Option<&serde_json::Value>) -> HashSet<String> {
     let mut set = HashSet::new();
@@ -143,27 +135,6 @@ fn agent_dirs() -> Vec<PathBuf> {
         dirs.push(home.join(".pi").join("agent"));
     }
     dirs
-}
-
-/// User-installed skills = every agent's skills folders: Claude Code's global
-/// `~/.claude/skills`, each agent dir's `skills/`, and the skills Oh My Pi
-/// installs from plugins. Project-level skill dirs are not scanned: they are
-/// per-project content, not an install, and folding them in inflates the
-/// "installed skills" metric.
-#[allow(dead_code)]
-fn load_user_skills() -> HashSet<String> {
-    let mut set = HashSet::new();
-    if let Some(h) = home() {
-        scan_skill_dir(&h.join(".claude").join("skills"), &mut set);
-        scan_plugin_skills(
-            &h.join(".omp").join("plugins").join("node_modules"),
-            &mut set,
-        );
-    }
-    for dir in agent_dirs() {
-        scan_skill_dir(&dir.join("skills"), &mut set);
-    }
-    set
 }
 
 /// Scan every config source under one home plus the given agent dirs.

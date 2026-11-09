@@ -578,7 +578,7 @@ impl Store {
     /// with no directory listing. A background tick with no watcher signal and
     /// no sparse-tick deadline calls this instead of [`Store::ingest`], so an
     /// idle tree of thousands of unchanged logs costs a handful of stats rather
-    /// than a full walk. A newly-appeared log file is not discovered here — the
+    /// than a full walk. A newly-appeared log file is not discovered here - the
     /// filesystem watcher or the next full (watcher/sparse-deadline) tick picks
     /// it up. The opencode sqlite db needs no walk (one known path plus a
     /// watermark query), so it is always included.
@@ -612,6 +612,38 @@ impl Store {
             .keys()
             .filter(|k| Path::new(k.as_str()).starts_with(root))
             .map(PathBuf::from)
+            .collect()
+    }
+
+    /// Candidate JSONL files under `root`: remembered files on a quiet tick
+    /// (no directory listing), otherwise a full walk for `*.jsonl` files.
+    /// 既知tickは記憶済みだけ再読し通常は列挙して新規を見つける
+    /// Tick known-only chỉ đọc file đã nhớ, tick thường liệt kê để bắt file mới
+    fn list_jsonl_paths(&self, root: &Path, known_only: bool) -> Vec<PathBuf> {
+        if known_only {
+            return self.known_paths_under(root);
+        }
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+            .map(|e| e.path().to_path_buf())
+            .collect()
+    }
+    /// Candidate files under `dir` for the opencode legacy JSON store (any
+    /// file, not just `*.jsonl`): remembered files on a quiet tick, otherwise
+    /// a full walk. Same known-only rule as [`Self::list_jsonl_paths`].
+    /// 既知tickは記憶済みだけ再読し通常は列挙して新規を見つける
+    /// Tick known-only chỉ đọc file đã nhớ, tick thường liệt kê để bắt file mới
+    fn list_all_paths(&self, dir: &Path, known_only: bool) -> Vec<PathBuf> {
+        if known_only {
+            return self.known_paths_under(dir);
+        }
+        WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
             .collect()
     }
 
@@ -707,16 +739,7 @@ impl Store {
         let mut dirty = false;
         // 既知tickは列挙を省き記憶済みだけ再読する
         // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
-        let paths: Vec<PathBuf> = if known_only {
-            self.known_paths_under(root)
-        } else {
-            WalkDir::new(root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .map(|e| e.path().to_path_buf())
-                .collect()
-        };
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             dirty |= self.scan_jsonl(&path, TOOL_CLAUDE, &mut |v, _st| parse_claude_line(v));
         }
@@ -738,16 +761,7 @@ impl Store {
         let mut dirty = false;
         // 既知tickは列挙を省き記憶済みだけ再読する
         // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
-        let paths: Vec<PathBuf> = if known_only {
-            self.known_paths_under(root)
-        } else {
-            WalkDir::new(root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .map(|e| e.path().to_path_buf())
-                .collect()
-        };
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             // one rollout file per session: the stem carries the session uuid
             let session = stem(&path);
@@ -774,16 +788,7 @@ impl Store {
         let mut dirty = false;
         // 既知tickは列挙を省き記憶済みだけ再読する
         // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
-        let paths: Vec<PathBuf> = if known_only {
-            self.known_paths_under(root)
-        } else {
-            WalkDir::new(root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .map(|e| e.path().to_path_buf())
-                .collect()
-        };
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             let session = omp_session_from_path(&path);
             dirty |= self.scan_jsonl(&path, TOOL_OMP, &mut |v, _st| {
@@ -811,16 +816,7 @@ impl Store {
         let mut dirty = false;
         // 既知tickは列挙を省き記憶済みだけ再読する
         // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
-        let paths: Vec<PathBuf> = if known_only {
-            self.known_paths_under(root)
-        } else {
-            WalkDir::new(root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .map(|e| e.path().to_path_buf())
-                .collect()
-        };
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             let session = pi_session_from_path(&path);
             dirty |= self.scan_jsonl(&path, TOOL_PI, &mut |v, _st| {
@@ -854,16 +850,7 @@ impl Store {
         let mut dirty = false;
         // 既知tickは列挙を省き記憶済みだけ再読する
         // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
-        let paths: Vec<PathBuf> = if known_only {
-            self.known_paths_under(dir)
-        } else {
-            WalkDir::new(dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_file())
-                .map(|e| e.path().to_path_buf())
-                .collect()
-        };
+        let paths = self.list_all_paths(dir, known_only);
         for path in paths {
             let key = path.to_string_lossy().to_string();
             let Ok(meta) = fs::metadata(&path) else {

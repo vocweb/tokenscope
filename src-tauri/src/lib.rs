@@ -1028,8 +1028,9 @@ pub fn run() {
             }
 
             // Build the menu-bar tray: app glyph (template icon) + today's tokens.
-            let dash = parser::build_dashboard();
-            let label = fmt_tokens_m(dash.today_tokens);
+            // 初回表示は即時に仮表示し実数は裏スレッドのrefreshで追更新する
+            // Lần đầu hiện ngay nhãn tạm, số thực do refresh ở luồng nền cập nhật
+            let label = fmt_tokens_m(0.0);
 
             let open_i = MenuItem::with_id(app, "open", "Open Tokenscope", true, None::<&str>)?;
             let refresh_i = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
@@ -1157,6 +1158,14 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            // 起動停止を避けるため初回集計は裏スレッドで行いrefreshがtrayを追更新する
+            // Tránh treo khởi động nên build đầu chạy luồng nền rồi refresh cập nhật tray
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    refresh(&handle);
+                });
+            }
 
             // Wire the checkbox handle into the state, then restore the last
             // session's detached window if it was open.

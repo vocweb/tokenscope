@@ -603,6 +603,12 @@ export default function App() {
   const [err, setErr] = useState<string | null>(null);
   const [openGen, setOpenGen] = useState(0);
   const [focused, setFocused] = useState(true); // browser preview: always "focused"
+  // パネル非表示中の更新は捨てて表示時の再取得に任せる
+  // Cập nhật lúc panel ẩn thì bỏ qua, lúc hiển thị lại sẽ tải dữ liệu mới
+  const focusedRef = useRef(true);
+  // 通常ウィンドウは常に表示扱いで更新を捨てない
+  // Cửa sổ detached luôn hiển thị nên không bao giờ bỏ cập nhật
+  const detachedRef = useRef(false);
   // Theme preference: explicit Dark / Light, or System (follows the OS
   // appearance live on both macOS and Windows via prefers-color-scheme). First
   // run defaults to System.
@@ -658,7 +664,17 @@ export default function App() {
     };
     // live updates pushed from the background refresh thread — swaps the data in
     // place (no Loading), so values update without any flicker.
-    listen<Dashboard>("dashboard-updated", (e) => apply(e.payload)).then(track);
+    // 通常ウィンドウか確認して非表示中の再描画を抑える
+    // Kiểm tra cửa sổ detached để nén vẽ lại khi panel đang ẩn
+    invoke<string>("get_window_mode")
+      .then((m) => { detachedRef.current = m === "window"; })
+      .catch(() => {});
+    listen<Dashboard>("dashboard-updated", (e) => {
+      // 非表示popoverの不可視再描画を避けてWebViewを休ませる
+      // Panel ẩn thì bỏ qua để WebView được ngủ thay vì vẽ lại vô hình
+      if (!focusedRef.current && !detachedRef.current) return;
+      apply(e.payload);
+    }).then(track);
     // System appearance pushed natively from Rust (macOS). The webview's
     // prefers-color-scheme is unreliable for our hidden, non-activating menu-bar
     // panel, so the native event is the source of truth for System mode there;
@@ -668,6 +684,7 @@ export default function App() {
     // refetch the instant the popover gains focus (i.e. is opened)
     getCurrentWindow()
       .onFocusChanged(({ payload: focused }) => {
+        focusedRef.current = focused;
         setFocused(focused);
         if (focused) {
           setOpenGen((g) => g + 1); // re-run the count-up on each open

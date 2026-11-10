@@ -212,6 +212,20 @@ fn opencode_paths() -> Option<(PathBuf, PathBuf)> {
         root.join("opencode.db"),
     ))
 }
+/// DBやWALの書き込みでリフレッシュが空回りするので監視対象をログ領域に絞る。
+/// Vùng dữ liệu hay biến động của tác tử đang chạy được loại khỏi giám sát, chỉ giữ vùng nhật ký tin nhắn và đường dẫn cơ sở dữ liệu.
+fn opencode_watch_roots_for(data_dir: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let msg_dir = data_dir.join("storage").join("message");
+    if msg_dir.is_dir() {
+        roots.push(msg_dir);
+    }
+    let db = data_dir.join("opencode.db");
+    if db.is_file() {
+        roots.push(db);
+    }
+    roots
+}
 
 /// Oh My Pi keeps one agent dir per profile: ~/.omp/agent plus
 /// ~/.omp/profiles/<name>/agent. Sessions live under <agent>/sessions/<project>/
@@ -250,9 +264,7 @@ pub fn watch_roots() -> Vec<PathBuf> {
         }
     }
     if let Some(opencode) = opencode_data_dir() {
-        if opencode.is_dir() {
-            roots.push(opencode);
-        }
+        roots.extend(opencode_watch_roots_for(&opencode));
     }
     for omp in omp_session_roots() {
         if omp.is_dir() {
@@ -567,6 +579,79 @@ impl Store {
         dirty
     }
 
+    /// Quiet-tick ingest: re-scan only files the manifest already remembers,
+    /// with no directory listing. A background tick with no watcher signal and
+    /// no sparse-tick deadline calls this instead of [`Store::ingest`], so an
+    /// idle tree of thousands of unchanged logs costs a handful of stats rather
+    /// than a full walk. A newly-appeared log file is not discovered here - the
+    /// filesystem watcher or the next full (watcher/sparse-deadline) tick picks
+    /// it up. The opencode sqlite db needs no walk (one known path plus a
+    /// watermark query), so it is always included.
+    pub fn ingest_known(&mut self) -> bool {
+        let mut dirty = false;
+        if let Some(root) = claude_dir() {
+            dirty |= self.ingest_claude_at(&root, true);
+        }
+        if let Some(root) = codex_sessions_dir() {
+            dirty |= self.ingest_codex_at(&root, true);
+        }
+        for root in omp_session_roots() {
+            dirty |= self.ingest_omp_at(&root, true);
+        }
+        if let Some(root) = pi_sessions_dir() {
+            dirty |= self.ingest_pi_at(&root, true);
+        }
+        if let Some((dir, db)) = opencode_paths() {
+            dirty |= self.ingest_opencode_json_at(&dir, true);
+            dirty |= self.ingest_opencode_db_at(&db);
+        }
+        dirty
+    }
+
+    /// Manifest-remembered files under `root`. The quiet tick re-stats exactly
+    /// these instead of listing the tree; `Path::starts_with` compares whole
+    /// components, so a sibling like `<root>-backup` never matches.
+    fn known_paths_under(&self, root: &Path) -> Vec<PathBuf> {
+        self.manifest
+            .files
+            .keys()
+            .filter(|k| Path::new(k.as_str()).starts_with(root))
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// Candidate JSONL files under `root`: remembered files on a quiet tick
+    /// (no directory listing), otherwise a full walk for `*.jsonl` files.
+    /// 既知tickは記憶済みだけ再読し通常は列挙して新規を見つける
+    /// Tick known-only chỉ đọc file đã nhớ, tick thường liệt kê để bắt file mới
+    fn list_jsonl_paths(&self, root: &Path, known_only: bool) -> Vec<PathBuf> {
+        if known_only {
+            return self.known_paths_under(root);
+        }
+        WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+            .map(|e| e.path().to_path_buf())
+            .collect()
+    }
+    /// Candidate files under `dir` for the opencode legacy JSON store (any
+    /// file, not just `*.jsonl`): remembered files on a quiet tick, otherwise
+    /// a full walk. Same known-only rule as [`Self::list_jsonl_paths`].
+    /// 既知tickは記憶済みだけ再読し通常は列挙して新規を見つける
+    /// Tick known-only chỉ đọc file đã nhớ, tick thường liệt kê để bắt file mới
+    fn list_all_paths(&self, dir: &Path, known_only: bool) -> Vec<PathBuf> {
+        if known_only {
+            return self.known_paths_under(dir);
+        }
+        WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
+            .collect()
+    }
+
     // ── shared incremental JSONL scan ─────────────────────────────────
     /// Read only the new bytes of one JSONL file and map each line to at most
     /// one event. `map` may mutate the file's persistent `FileState` (codex/omp
@@ -652,13 +737,14 @@ impl Store {
         let Some(root) = claude_dir() else {
             return false;
         };
+        self.ingest_claude_at(&root, false)
+    }
+
+    fn ingest_claude_at(&mut self, root: &Path, known_only: bool) -> bool {
         let mut dirty = false;
-        let paths: Vec<PathBuf> = WalkDir::new(&root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        // 既知tickは列挙を省き記憶済みだけ再読する
+        // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             dirty |= self.scan_jsonl(&path, TOOL_CLAUDE, &mut |v, _st| parse_claude_line(v));
         }
@@ -673,13 +759,14 @@ impl Store {
         if !root.is_dir() {
             return false;
         }
+        self.ingest_codex_at(&root, false)
+    }
+
+    fn ingest_codex_at(&mut self, root: &Path, known_only: bool) -> bool {
         let mut dirty = false;
-        let paths: Vec<PathBuf> = WalkDir::new(&root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        // 既知tickは列挙を省き記憶済みだけ再読する
+        // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             // one rollout file per session: the stem carries the session uuid
             let session = stem(&path);
@@ -697,18 +784,21 @@ impl Store {
             if !root.is_dir() {
                 continue;
             }
-            let paths: Vec<PathBuf> = WalkDir::new(&root)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-                .map(|e| e.path().to_path_buf())
-                .collect();
-            for path in paths {
-                let session = omp_session_from_path(&path);
-                dirty |= self.scan_jsonl(&path, TOOL_OMP, &mut |v, _st| {
-                    parse_omp_line(v, &session)
-                });
-            }
+            dirty |= self.ingest_omp_at(&root, false);
+        }
+        dirty
+    }
+
+    fn ingest_omp_at(&mut self, root: &Path, known_only: bool) -> bool {
+        let mut dirty = false;
+        // 既知tickは列挙を省き記憶済みだけ再読する
+        // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
+        let paths = self.list_jsonl_paths(root, known_only);
+        for path in paths {
+            let session = omp_session_from_path(&path);
+            dirty |= self.scan_jsonl(&path, TOOL_OMP, &mut |v, _st| {
+                parse_omp_line(v, &session)
+            });
         }
         dirty
     }
@@ -724,13 +814,14 @@ impl Store {
         if !root.is_dir() {
             return false;
         }
+        self.ingest_pi_at(&root, false)
+    }
+
+    fn ingest_pi_at(&mut self, root: &Path, known_only: bool) -> bool {
         let mut dirty = false;
-        let paths: Vec<PathBuf> = WalkDir::new(&root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "jsonl").unwrap_or(false))
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        // 既知tickは列挙を省き記憶済みだけ再読する
+        // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
+        let paths = self.list_jsonl_paths(root, known_only);
         for path in paths {
             let session = pi_session_from_path(&path);
             dirty |= self.scan_jsonl(&path, TOOL_PI, &mut |v, _st| {
@@ -753,13 +844,18 @@ impl Store {
         if !dir.is_dir() {
             return false;
         }
+        self.ingest_opencode_json_at(&dir, false)
+    }
+
+    /// Known-only mode re-stats remembered files (catching rewrites) but cannot
+    /// discover brand-new message files — one file per message here, so an
+    /// append IS a new file. Discovery waits for the watcher or full tick, the
+    /// same rule as new files in every other agent.
+    fn ingest_opencode_json_at(&mut self, dir: &Path, known_only: bool) -> bool {
         let mut dirty = false;
-        let paths: Vec<PathBuf> = WalkDir::new(&dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        // 既知tickは列挙を省き記憶済みだけ再読する
+        // Tick known-only bỏ liệt kê, chỉ đọc lại những file đã nhớ
+        let paths = self.list_all_paths(dir, known_only);
         for path in paths {
             let key = path.to_string_lossy().to_string();
             let Ok(meta) = fs::metadata(&path) else {
@@ -2144,6 +2240,39 @@ mod tests {
     }
 
     #[test]
+    fn opencode_watch_excludes_churn_but_keeps_message_log() {
+        let root = std::env::temp_dir()
+            .join(format!("tokenscope-ocw-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let msg_dir = root.join("storage").join("message").join("ses_1");
+        fs::create_dir_all(&msg_dir).unwrap();
+        fs::write(msg_dir.join("msg_a.json"), "{}").unwrap();
+        for f in ["opencode.db", "opencode.db-wal", "opencode.db-shm", "auth.json"] {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        let roots = opencode_watch_roots_for(&root);
+        assert!(roots.contains(&root.join("storage").join("message")));
+        assert!(roots.contains(&root.join("opencode.db")));
+        assert!(!roots.contains(&root));
+        assert!(roots.iter().all(|r| {
+            r.file_name()
+                .map(|n| n != "auth.json" && !n.to_string_lossy().ends_with("-wal") && !n.to_string_lossy().ends_with("-shm"))
+                .unwrap_or(true)
+        }));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn opencode_watch_is_empty_when_nothing_to_watch() {
+        let root = std::env::temp_dir()
+            .join(format!("tokenscope-ocw-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        assert!(opencode_watch_roots_for(&root).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn opencode_sqlite_rows_are_ingested_and_replace_on_update() {
         use rusqlite::params;
         let dir = std::env::temp_dir().join(format!("tokenscope-oc-{}", std::process::id()));
@@ -2298,5 +2427,120 @@ mod tests {
         );
         assert_eq!(omp_session_from_path(main), "2026-09-23T10-36-49-393Z_01a0cdd6");
         assert_eq!(omp_session_from_path(main), omp_session_from_path(sub));
+    }
+
+    #[test]
+    fn known_scan_ignores_new_files_that_full_scan_discovers() {
+        // 既知のみtickは列挙しないため新規ファイルを拾わないことを振る舞いで固定する
+        // Khóa hành vi bằng quan sát: tick known-only không liệt kê nên bỏ qua file mới
+        let dir = std::env::temp_dir().join(format!("tokenscope-known-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let usage = |input: u64, output: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-09-03T15:29:47.868Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0}}}}}}}}\n"
+            )
+        };
+        fs::write(sessions.join("rollout-first.jsonl"), usage(10, 2)).unwrap();
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        assert!(s.ingest_codex_at(&sessions, false));
+        assert_eq!(s.events.len(), 1);
+
+        // A new log file lands after the full scan remembered the tree.
+        fs::write(sessions.join("rollout-second.jsonl"), usage(30, 4)).unwrap();
+        assert!(!s.ingest_codex_at(&sessions, true));
+        assert_eq!(s.events.len(), 1);
+
+        // The watcher or sparse-deadline full scan discovers it.
+        assert!(s.ingest_codex_at(&sessions, false));
+        assert_eq!(s.events.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_scan_still_ingests_appends_to_remembered_files() {
+        // 追記は既知ファイルの差分読みで拾うため軽量tickでも遅延しない
+        // Tick nhẹ vẫn đọc phần nối thêm của file đã nhớ nên không trễ số liệu
+        let dir = std::env::temp_dir().join(format!("tokenscope-append-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let usage = |input: u64, output: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-09-03T15:29:47.868Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0}}}}}}}}\n"
+            )
+        };
+        let file = sessions.join("rollout-only.jsonl");
+        fs::write(&file, usage(10, 2)).unwrap();
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        assert!(s.ingest_codex_at(&sessions, false));
+        assert_eq!(s.events.len(), 1);
+
+        fs::write(&file, format!("{}{}", usage(10, 2), usage(30, 4))).unwrap();
+        assert!(s.ingest_codex_at(&sessions, true));
+        assert_eq!(s.events.len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quiet_tick_ingests_appends_without_discovering_new_files() {
+        // 空tickは既知差分だけ読み新規はwatcherか疎tickが拾う
+        // Tick lặng chỉ đọc phần nối thêm của file đã nhớ; file mới do watcher hoặc tick thưa phát hiện
+        // CODEX/PI/OPENCODE roots are pointed at throwaway dirs; no other test
+        // reads those vars, so this stays hermetic under parallel runs.
+        let base = std::env::temp_dir().join(format!("tokenscope-quiet-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let codex = base.join("codex").join("sessions");
+        let pi = base.join("pi");
+        let oc = base.join("oc");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&pi).unwrap();
+        fs::create_dir_all(&oc).unwrap();
+        unsafe {
+            std::env::set_var("CODEX_HOME", base.join("codex"));
+            std::env::set_var("PI_SESSIONS_DIR", &pi);
+            std::env::set_var("OPENCODE_DATA", &oc);
+        }
+        let usage = |input: u64, output: u64| {
+            format!(
+                "{{\"timestamp\":\"2026-09-03T15:29:47.868Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":{{\"input_tokens\":{input},\"cached_input_tokens\":0,\"output_tokens\":{output},\"reasoning_output_tokens\":0}}}}}}}}\n"
+            )
+        };
+        let file = codex.join("2026/09/03/rollout-only.jsonl");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, usage(10, 2)).unwrap();
+        let mut s = Store {
+            events: Vec::new(),
+            index: HashMap::new(),
+            manifest: Manifest::default(),
+        };
+        assert!(s.ingest_codex_at(&codex, false));
+        assert_eq!(s.events.len(), 1);
+
+        // Append to the remembered file: the quiet tick ingests it.
+        fs::write(&file, format!("{}{}", usage(10, 2), usage(30, 4))).unwrap();
+        assert!(s.ingest_known());
+        assert_eq!(s.events.len(), 2);
+
+        // A brand-new file appears: the quiet tick stays clean and ignores it.
+        fs::write(codex.join("rollout-fresh.jsonl"), usage(50, 6)).unwrap();
+        assert!(!s.ingest_known());
+        assert_eq!(s.events.len(), 2);
+
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
+            std::env::remove_var("PI_SESSIONS_DIR");
+            std::env::remove_var("OPENCODE_DATA");
+        }
+        let _ = fs::remove_dir_all(&base);
     }
 }
